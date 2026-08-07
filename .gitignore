@@ -1,0 +1,39 @@
+# Credentials and Environment
+.env
+.env.*
+!*.template
+
+# Caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+
+# Build and Packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Backups and Temporary files
+*.backup
+*.bak
+temp/
+downloads/
+output/
+*.log
+
+# Example outputs
+examples/artifacts/
+
+# AI Context
+docs

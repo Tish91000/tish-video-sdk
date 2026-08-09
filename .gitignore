@@ -4,9 +4,9 @@
 !*.template
 service-account/
 language_config.json
-voice_packs.json
-voice_packs.*.json
-!voice_packs.example.json
+configuration/voice_packs.json
+configuration/voice_packs.*.json
+!configuration/*.example.json
 
 # Caches
 __pycache__/
@@ -37,8 +37,21 @@ downloads/
 output/
 *.log
 
+# Generated/downloaded audio -- narration output, cached BGM tracks, etc.
+# (this SDK's own test/example audio, not source assets meant to be tracked)
+*.wav
+*.mp3
+
 # Example outputs
 examples/artifacts/
 
+# Real background-music library used for local testing (licensed audio,
+# not SDK content) -- see configuration/music_moods.example.json for the mood-config shape.
+examples/music/
+
 # AI Context
 docs
+
+# Local dev tools (may embed real credentials for convenience, e.g.
+# tools/jamendo_playground's client_id) -- never committed.
+tools/

@@ -1,0 +1,9 @@
+{
+  "moods": {
+    "calm": "Peaceful, reflective, reassuring -- suited to quiet or contemplative moments.",
+    "joy": "Upbeat, celebratory, warm -- suited to positive, uplifting moments.",
+    "adventurous": "Energetic, driven, triumphant -- suited to moments of action or overcoming odds.",
+    "dark": "Somber, tense, subdued -- suited to serious or sorrowful moments."
+  },
+  "prompt_template": "Analyze the following text and determine its primary mood.\nChoose one of the following moods: {mood_list}.\n\nHere are descriptions for each mood to guide your choice:\n{mood_descriptions}\n\nText:\n\"{text}\"\n\nYour task:\nRespond with only the single word for the chosen mood in lowercase. For example: calm"
+}

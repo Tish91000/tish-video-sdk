@@ -45,3 +45,17 @@ The ``subtitles`` module (subtitle generation via forced alignment, used by
   was installed into. Only needed if a language's SubtitlePack has an ``mfa_model`` and
   ``USE_MFA_ALIGNMENT`` (the default) is left ``True``; set it to ``False`` to use
   time-based text splitting instead, which needs no external install.
+
+The ``music`` module (background-music selection and mixing, via ``MusicManager``) reads:
+
+* ``MUSIC_MOODS_PATH`` — optional path to a JSON file (see ``music_moods.example.json``)
+  overriding the available moods and/or the Gemini mood-analysis prompt template.
+  ``MusicManager`` ships generic, domain-neutral moods and a generic prompt by default;
+  this only needs to override them to match a specific project's ``bgm_directory`` mood
+  subfolders or content domain. Can also be passed directly as ``MusicManager(mood_packs_path=...)``.
+* ``JAMENDO_CLIENT_ID`` — optional, free (register at `devportal.jamendo.com
+  <https://devportal.jamendo.com/>`_). When set, a mood with no usable local track
+  downloads one free, Creative-Commons-licensed track from Jamendo into ``bgm_directory``
+  instead of falling back to ``default_music_file`` -- the downloaded file behaves like
+  any other local track from then on. Can also be passed directly as
+  ``MusicManager(jamendo_client_id=...)``.

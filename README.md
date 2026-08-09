@@ -7,6 +7,7 @@ A Python SDK for generating videos with narration, subtitles, music, and imagery
 - **Text-to-speech narration** via Google Cloud TTS or Gemini, with automatic SSML generation
 - **Video generation** from a single image or timestamped image/video segments, paired with provided audio or TTS narration, with image/video overlay support
 - **Timed text overlays** (titles, captions, karaoke-style word-highlighted text) composited onto the video
+- **Subtitle generation** from narration audio via forced alignment (Montreal Forced Aligner) or time-based splitting, styled per language via SubtitlePack config
 
 ## Installation
 

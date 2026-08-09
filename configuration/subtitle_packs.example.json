@@ -1,0 +1,14 @@
+[
+  {
+    "language_code": "fr",
+    "mfa_model": "french_mfa",
+    "font_size": 60,
+    "font_color": "white",
+    "bg_color": "black",
+    "text_position": ["center", "bottom"]
+  },
+  {
+    "language_code": "de",
+    "mfa_model": "german_mfa"
+  }
+]

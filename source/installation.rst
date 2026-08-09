@@ -33,3 +33,15 @@ call: omit ``provider`` to try every VoicePack configured for that language in o
 falling back to the next on failure, or pass one (e.g. ``provider="google_cloud"``) to pin
 to it and disable fallback. ``TTSBuilder.available_providers(language_code)`` lists what's
 configured for a language.
+
+The ``subtitles`` module (subtitle generation via forced alignment, used by
+``TTSBuilder.with_subtitles()``/``VideoBuilder.with_tts_subtitles()``) reads:
+
+* ``SUBTITLE_PACKS_PATH`` — optional path to a JSON file (see
+  ``subtitle_packs.example.json``) listing SubtitlePacks: per-language MFA acoustic model
+  name and default text styling. Built-in defaults already cover ``fr``/``en``/``es``/``ta``;
+  this only needs to add languages or override a pack's model/styling.
+* ``MFA_ENV_PATH`` — root directory of the conda/mamba environment Montreal Forced Aligner
+  was installed into. Only needed if a language's SubtitlePack has an ``mfa_model`` and
+  ``USE_MFA_ALIGNMENT`` (the default) is left ``True``; set it to ``False`` to use
+  time-based text splitting instead, which needs no external install.

@@ -6,3 +6,4 @@ API Reference
 
    tts
    video_maker
+   subtitles

@@ -3,22 +3,30 @@ import re
 import json
 import io
 import hashlib
-from typing import Optional, List
-from dotenv import load_dotenv
+import tempfile
+from typing import Optional, List, Dict
+from dotenv import find_dotenv, load_dotenv
 from pydub import AudioSegment
 
 from .internal.providers.voice_packs import VoicePack, VoicePackSynthesisError, SynthesisResult, load_voice_packs
+from .subtitles import SubtitleBuilder
 
 # --- Configuration ---
 # TTS_VOICE_PACKS_PATH points at a JSON file listing every VoicePack (provider
 # x language combination) this process might use -- see
-# voice_packs.example.json for the expected shape. All entries are loaded once
+# configuration/voice_packs.example.json for the expected shape. All entries are loaded once
 # at import time; each TTSBuilder call filters them down to the language (and
 # optionally a single pinned provider) it actually wants, via
 # VoicePack.filter_chain() -- see TTSBuilder.__init__. TTS_LANGUAGE_CODE is an
 # optional default language_code for callers that don't pass one explicitly.
 
-load_dotenv()
+# usecwd=True: this SDK is installed editable and imported by several sibling
+# projects, each with its own .env. Without usecwd, find_dotenv() resolves
+# relative to *this file's* location (tish_video_sdk/), so it would always load
+# this package's own .env instead of the importing project's -- usecwd anchors
+# the search to the process's actual working directory instead, matching
+# whichever project launched it.
+load_dotenv(find_dotenv(usecwd=True))
 
 
 def _load_all_voice_packs() -> tuple:
@@ -28,7 +36,7 @@ def _load_all_voice_packs() -> tuple:
     if not voice_packs_path:
         raise RuntimeError(
             "TTS_VOICE_PACKS_PATH is not set. Point it at a voice_packs.json listing "
-            "the VoicePacks available to this process -- see voice_packs.example.json."
+            "the VoicePacks available to this process -- see configuration/voice_packs.example.json."
         )
 
     all_packs = load_voice_packs(voice_packs_path)
@@ -157,9 +165,12 @@ class TTSBuilder:
         self._content_text: Optional[str] = None
         self._processed_content: Optional[str] = None
         self._audio_chunks: List[bytes] = []
+        self._audio_filepath: Optional[str] = None
         self._is_built = False
         self.used_provider: Optional[str] = None
         self._used_voice_pack: Optional[VoicePack] = None
+        self._generate_subtitles = False
+        self._subtitle_builder: Optional[SubtitleBuilder] = None
 
     @classmethod
     def from_text(cls, text: str, language_code: Optional[str] = None, provider: Optional[str] = None, use_llm_ssml: bool = True, cache_dir: Optional[str] = None) -> 'TTSBuilder':
@@ -198,6 +209,20 @@ class TTSBuilder:
                 "No language_code was given and TTS_LANGUAGE_CODE is not set as a default."
             )
         return [pack.provider for pack in VoicePack.filter_chain(_ALL_VOICE_PACKS, language_code)]
+
+    def with_subtitles(self) -> 'TTSBuilder':
+        """
+        Enable subtitle generation for the synthesized audio using forced
+        alignment (see tish_video_sdk.subtitles.SubtitleBuilder). Segments are
+        available after build() via get_subtitle_segments(), in the shape
+        VideoBuilder.with_text_segments()/with_tts_subtitles() expect.
+
+        Returns:
+            TTSBuilder: Self for method chaining.
+        """
+        self._generate_subtitles = True
+        self._subtitle_builder = SubtitleBuilder(self.language_code)
+        return self
 
     @classmethod
     def concatenate(cls, tts_builders: List['TTSBuilder']) -> Optional['TTSBuilder']:
@@ -291,6 +316,35 @@ class TTSBuilder:
 
         print(f"  Created single WAV file: {len(complete_wav):,} bytes")
 
+        # Merge subtitle segments with time offsets
+        has_subtitles = any(builder._subtitle_builder is not None for builder in tts_builders)
+        if has_subtitles:
+            new_builder._generate_subtitles = True
+            new_builder._subtitle_builder = SubtitleBuilder(new_builder.language_code)
+
+            merged_segments = []
+            cumulative_duration = 0.0
+            for builder in tts_builders:
+                current_duration = builder._calculate_audio_duration()
+                if builder._subtitle_builder:
+                    for segment in builder._subtitle_builder.get_segments():
+                        seg_start = segment['start']
+                        seg_end = segment['end']
+                        if seg_start >= current_duration:
+                            continue  # Skip segments that start after audio ends
+                        if seg_end > current_duration:
+                            seg_end = current_duration  # Clamp end time
+                        merged_segments.append({
+                            'text': segment['text'],
+                            'start': seg_start + cumulative_duration,
+                            'end': seg_end + cumulative_duration,
+                        })
+                cumulative_duration += current_duration
+
+            new_builder._subtitle_builder._transcribed_segments = merged_segments
+            new_builder._subtitle_builder._is_built = True
+            print(f"  Merged {len(merged_segments)} subtitle segments")
+
         processed_contents = []
         is_ssml = False
         if tts_builders and tts_builders[0]._processed_content and tts_builders[0]._processed_content.strip().startswith('<speak>'):
@@ -336,6 +390,8 @@ class TTSBuilder:
                 print("Cache Hit! Loading TTS from cache.")
                 self._audio_chunks = cached_builder._audio_chunks
                 self._processed_content = cached_builder._processed_content
+                self._generate_subtitles = cached_builder._generate_subtitles
+                self._subtitle_builder = cached_builder._subtitle_builder
                 self._is_built = True
                 self.used_provider = "cache"
                 return self
@@ -388,6 +444,25 @@ class TTSBuilder:
                 self.used_provider = provider
                 self._used_voice_pack = voice_pack
                 self._is_built = True
+
+                if self._generate_subtitles and self._subtitle_builder:
+                    print("Generating subtitles from synthesized audio...")
+                    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_audio:
+                        temp_path = temp_audio.name
+                        for chunk in self._audio_chunks:
+                            temp_audio.write(chunk)
+                    try:
+                        self._audio_filepath = temp_path
+                        if not self._generate_subtitles_from_audio():
+                            print("Error: Subtitle generation failed during build.")
+                            self._is_built = False
+                            return None
+                    finally:
+                        self._audio_filepath = None
+                        try:
+                            os.unlink(temp_path)
+                        except OSError as e:
+                            print(f"Warning: Failed to delete temp audio file {temp_path}: {e}")
 
                 if self.cache_dir:
                     print("Saving to TTS Cache...")
@@ -449,6 +524,11 @@ class TTSBuilder:
                     print("Error: Failed to combine any audio chunks.")
                     return None
             print(f"Audio successfully saved to '{output_filepath}'")
+
+            self._audio_filepath = output_filepath
+            if self._subtitle_builder:
+                self._subtitle_builder._audio_filepath = output_filepath
+
             return output_filepath
         except IOError as e:
             print(f"Error saving audio file '{output_filepath}': {e}")
@@ -465,6 +545,98 @@ class TTSBuilder:
             Optional[str]: The processed content if available, None otherwise.
         """
         return self._processed_content
+
+    def get_subtitle_segments(self) -> List[Dict]:
+        """
+        Get the generated subtitle segments if available.
+
+        Returns:
+            List[Dict]: List of subtitle segments with 'text', 'start', and 'end' keys.
+        """
+        if self._subtitle_builder:
+            return self._subtitle_builder.get_segments()
+        return []
+
+    def save_subtitles_to_json(self, output_filepath: str) -> Optional[str]:
+        """
+        Save the subtitle segments to a JSON file.
+
+        Args:
+            output_filepath (str): The path where the JSON file will be saved.
+
+        Returns:
+            Optional[str]: The path to the saved JSON file if successful, None otherwise.
+        """
+        if not self._subtitle_builder:
+            print("Error: No subtitle builder available. Enable subtitles with with_subtitles() first.")
+            return None
+        return self._subtitle_builder.save_segments_to_json(output_filepath)
+
+    def _calculate_audio_duration(self) -> float:
+        """
+        Calculate the total duration of synthesized audio in seconds, from the
+        raw WAV byte size (24kHz/16-bit/mono, matching _normalize_to_wav's
+        output format).
+
+        Returns:
+            float: Duration in seconds, or 0.0 if audio not available.
+        """
+        if not self._audio_chunks:
+            return 0.0
+        try:
+            combined_audio = b''.join(self._audio_chunks)
+            if combined_audio[:4] == b'RIFF':
+                pos = 12
+                pcm_size = len(combined_audio) - 44
+                while pos < len(combined_audio):
+                    if pos + 8 > len(combined_audio):
+                        break
+                    chunk_id = combined_audio[pos:pos + 4]
+                    chunk_size = int.from_bytes(combined_audio[pos + 4:pos + 8], 'little')
+                    if chunk_id == b'data':
+                        pcm_size = chunk_size
+                        break
+                    pos += 8 + chunk_size
+            else:
+                pcm_size = len(combined_audio)
+
+            sample_rate = 24000
+            sample_width = 2
+            channels = 1
+            return pcm_size / (sample_rate * sample_width * channels)
+        except Exception as e:
+            print(f"Error calculating audio duration: {e}")
+            return 0.0
+
+    def _generate_subtitles_from_audio(self) -> bool:
+        """
+        Generate subtitles from the synthesized audio using the reference text.
+
+        Returns:
+            bool: True if successful, False otherwise.
+        """
+        if not self._subtitle_builder or not self._audio_filepath:
+            print("Error: Subtitle builder or audio file not available.")
+            return False
+
+        try:
+            # ALWAYS use the original content text as reference to avoid leaking
+            # SSML tags that convert_to_ssml() may have introduced.
+            self._subtitle_builder._audio_filepath = self._audio_filepath
+            self._subtitle_builder._reference_text = self._content_text
+
+            result = self._subtitle_builder.build()
+            if result:
+                segments = self._subtitle_builder.get_segments()
+                print(f"Successfully generated {len(segments)} subtitle segments.")
+                return True
+            else:
+                print("Failed to generate subtitles.")
+                return False
+
+        except Exception as e:
+            print(f"Error generating subtitles: {e}")
+            return False
 
     def _calculate_audio_hash(self) -> str:
         """Calculate a basic hash of the content for caching (legacy/basic)."""
@@ -485,7 +657,7 @@ class TTSBuilder:
         if self._content_text:
             hasher.update(self._content_text.encode('utf-8'))
 
-        params = [self.language_code, str(self.use_llm_ssml)]
+        params = [self.language_code, str(self.use_llm_ssml), str(self._generate_subtitles)]
         for voice_pack in self._voice_pack_chain:
             params.append(voice_pack.provider)
             params.append(voice_pack.voice_name)
@@ -524,6 +696,7 @@ class TTSBuilder:
             "used_provider": self.used_provider,
             "audio_chunks": [chunk.hex() for chunk in self._audio_chunks],
             "processed_content": self._processed_content,
+            "subtitle_segments": self._subtitle_builder.get_segments() if self._subtitle_builder else [],
         }
 
         try:
@@ -567,6 +740,12 @@ class TTSBuilder:
 
             if "audio_chunks" in cache_data:
                 builder._audio_chunks = [bytes.fromhex(chunk) for chunk in cache_data["audio_chunks"]]
+
+            if cache_data.get("subtitle_segments"):
+                builder._generate_subtitles = True
+                builder._subtitle_builder = SubtitleBuilder(language_code)
+                builder._subtitle_builder._transcribed_segments = cache_data["subtitle_segments"]
+                builder._subtitle_builder._is_built = True
 
             builder._is_built = True
 

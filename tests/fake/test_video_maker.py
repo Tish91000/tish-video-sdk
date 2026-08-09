@@ -2,11 +2,6 @@
 calls, or ffmpeg invocations, safe to run anywhere.
 
 Run with: pytest tests/fake
-
-Subtitle support (auto-generating text segments via forced alignment, and the
-advanced multi-segment "chapelet" builder) isn't available yet -- see ADR
-0003 -- so there's nothing to test for it here; it's built on top of
-with_text_segments() once tish_video_sdk.subtitles lands.
 """
 import pytest
 from unittest.mock import MagicMock, patch
@@ -211,3 +206,172 @@ class TestTextSegments:
         builder.with_text_segments([{'text': 'Title', 'start': 0.0, 'end': 5.0}])
 
         assert builder.build() is None
+
+
+class TestSubtitlesWiring:
+    def test_with_subtitles_is_a_thin_wrapper_over_text_segments(self):
+        builder = VideoBuilder()
+        segments = [{'text': 'Hello', 'start': 0.0, 'end': 1.0}]
+        style = TextStyle(font_color='white')
+
+        result = builder.with_subtitles(segments, style=style)
+
+        assert result is builder
+        assert builder._text_segments == segments
+        assert builder._text_style is style
+
+    def test_with_tts_subtitles_sets_flag_not_segments(self):
+        builder = VideoBuilder()
+        style = TextStyle(font_color='yellow')
+
+        result = builder.with_tts_subtitles(style=style)
+
+        assert result is builder
+        assert builder._enable_tts_subtitles is True
+        assert builder._text_style is style
+        assert builder._text_segments is None  # not known until build() runs TTS
+
+    def test_with_tts_subtitles_defaults_to_language_subtitle_pack(self):
+        # 'fr' has a built-in SubtitlePack (see DEFAULT_SUBTITLE_PACKS) --
+        # no explicit style means resolve one from it rather than a bare TextStyle().
+        builder = VideoBuilder.from_single_image_with_tts('path/to/image.jpg', 'Bonjour', 'fr')
+        builder.with_tts_subtitles()
+
+        assert builder._text_style is not None
+        assert builder._text_style.language_code == 'fr'
+
+    def test_with_subtitles_falls_back_to_bare_text_style_without_a_language(self):
+        # No TTS involved, so no language is known -- nothing to resolve a
+        # SubtitlePack from, so with_text_segments()'s own TextStyle() default applies.
+        builder = VideoBuilder()
+        builder.with_subtitles([{'text': 'Hello', 'start': 0.0, 'end': 1.0}])
+
+        assert builder._text_style is None
+
+    @patch('tish_video_sdk.video_maker.TTSBuilder')
+    def test_generate_tts_audio_enables_subtitles_on_tts_builder_when_requested(self, mock_tts_builder_cls):
+        mock_instance = MagicMock()
+        mock_instance.with_subtitles.return_value = mock_instance
+        mock_instance.build.return_value = MagicMock()
+        mock_instance.save.return_value = '/tmp/tts_audio.wav'
+        mock_tts_builder_cls.from_text.return_value = mock_instance
+
+        builder = VideoBuilder.from_single_image_with_tts('path/to/image.jpg', 'Hello world', 'xx')
+        builder.with_tts_subtitles()
+        builder._generate_tts_audio()
+
+        mock_instance.with_subtitles.assert_called_once()
+
+    @patch('tish_video_sdk.video_maker.os.path.exists')
+    @patch('tish_video_sdk.video_maker.VideoBuilder._overlay_text_segments_on_single_clip')
+    @patch('tish_video_sdk.video_maker.VideoBuilder._generate_tts_audio')
+    @patch('tish_video_sdk.video_maker.VideoBuilder._load_image_clip_safe')
+    @patch('tish_video_sdk.video_maker.AudioFileClip')
+    def test_build_extracts_and_applies_tts_subtitles(self, mock_audio_clip, mock_load_image, mock_generate_tts, mock_overlay, mock_exists):
+        mock_exists.return_value = True
+
+        mock_audio = MagicMock()
+        mock_audio.duration = 5.0
+        mock_audio_clip.return_value = mock_audio
+
+        def _fake_generate_tts_audio(self=None):
+            builder._audio_filepath = 'path/to/tts_audio.wav'
+            return True
+        mock_generate_tts.side_effect = _fake_generate_tts_audio
+
+        mock_video = MagicMock()
+        mock_video.duration = 5.0
+        mock_video.with_fps.return_value = mock_video
+
+        mock_image = MagicMock()
+        mock_load_image.return_value = mock_image
+        mock_image.with_duration.return_value = mock_video
+        mock_video.with_audio.return_value = mock_video
+
+        mock_overlaid = MagicMock()
+        mock_overlaid.duration = 5.0
+        mock_overlay.return_value = mock_overlaid
+
+        segments = [{'text': 'Hello', 'start': 0.0, 'end': 5.0}]
+        mock_tts_builder = MagicMock()
+        mock_tts_builder.get_subtitle_segments.return_value = segments
+
+        builder = VideoBuilder.from_single_image_with_tts('path/to/image.jpg', 'Hello world', 'xx')
+        builder.with_tts_subtitles()
+        builder._tts_builder = mock_tts_builder  # what the (mocked) _generate_tts_audio would have set
+
+        result = builder.build()
+
+        assert result is mock_overlaid
+        mock_overlay.assert_called_once_with(mock_video, segments)
+
+
+class TestAdvancedSegments:
+    def test_from_multi_segments_advanced_sets_state(self):
+        segments = [{'image': 'a.png', 'text': 'Hello', 'repeat': 2}]
+        builder = VideoBuilder.from_multi_segments_advanced(segments)
+        assert builder._advanced_segments == segments
+
+    def test_expand_segments_skips_missing_fields(self):
+        builder = VideoBuilder.from_multi_segments_advanced([{'text': 'no image'}])
+        assert builder._expand_segments_with_repetitions() == []
+
+    @patch('tish_video_sdk.video_maker.VideoBuilder._generate_and_cache_audio')
+    def test_expand_segments_with_repetitions(self, mock_generate_cache):
+        mock_generate_cache.return_value = True
+
+        segments = [
+            {'image': 'a.png', 'text': 'Hello', 'language_code': 'xx', 'repeat': 3},
+            {'image': 'b.png', 'text': 'World', 'language_code': 'xx'},
+        ]
+        builder = VideoBuilder.from_multi_segments_advanced(segments)
+
+        expanded = builder._expand_segments_with_repetitions()
+
+        assert len(expanded) == 4  # 3 repeats of "Hello" + 1 "World"
+        hello_reps = [s['_repetition'] for s in expanded if s['text'] == 'Hello']
+        assert hello_reps == [1, 2, 3]
+        # Audio generation runs once per unique text, not once per repetition.
+        assert mock_generate_cache.call_count == 2
+
+    @patch('tish_video_sdk.video_maker.VideoBuilder._generate_and_cache_audio')
+    def test_expand_segments_skips_segment_when_tts_generation_fails(self, mock_generate_cache):
+        mock_generate_cache.return_value = False
+
+        builder = VideoBuilder.from_multi_segments_advanced(
+            [{'image': 'a.png', 'text': 'Hello', 'language_code': 'xx'}]
+        )
+
+        assert builder._expand_segments_with_repetitions() == []
+
+    def test_create_segment_video_clip_reuses_video_cache(self):
+        cached_clip = MagicMock()
+        cached_clip.copy.return_value = cached_clip
+        cached_clip.duration = 2.0
+
+        builder = VideoBuilder()
+        builder._video_cache['key'] = cached_clip
+
+        with patch('tish_video_sdk.video_maker.ImageClip') as mock_image_clip:
+            result = builder._create_segment_video_clip(
+                {'_video_cache_key': 'key', '_audio_cache_key': 'a', '_repetition': 2}, 0.0
+            )
+            mock_image_clip.assert_not_called()  # cache hit skips clip creation entirely
+
+        assert result is cached_clip
+
+    def test_cleanup_cache_clears_all_caches_and_closes_clips(self):
+        builder = VideoBuilder()
+        mock_video_clip = MagicMock()
+        mock_bgm_clip = MagicMock()
+        builder._audio_cache = {'k': {'audio_path': None}}
+        builder._video_cache = {'k': mock_video_clip}
+        builder._bgm_cache = {'k': mock_bgm_clip}
+
+        builder.cleanup_cache()
+
+        assert builder._audio_cache == {}
+        assert builder._video_cache == {}
+        assert builder._bgm_cache == {}
+        mock_video_clip.close.assert_called_once()
+        mock_bgm_clip.close.assert_called_once()

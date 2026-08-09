@@ -7,7 +7,7 @@ Text-to-speech synthesis via an ordered chain of VoicePacks (Gemini, Google
 Cloud, ...), with automatic SSML generation on providers that support it.
 Every VoicePack this process might use is loaded once, at import, from the
 JSON file at ``TTS_VOICE_PACKS_PATH`` (see ``.env.template``,
-``voice_packs.example.json``, and :doc:`../installation`) — one process can
+``configuration/voice_packs.example.json``, and :doc:`../installation`) — one process can
 build :class:`TTSBuilder` instances for multiple languages, each filtering
 that pool down to its own chain.
 
@@ -30,3 +30,7 @@ Usage
 
    # Or pin to exactly one provider (disables fallback):
    tts = TTSBuilder.from_text("Bonjour le monde", "fr", provider="google_cloud").build()
+
+   # Enable subtitle generation (forced alignment, see :doc:`subtitles`):
+   tts = TTSBuilder.from_text("Bonjour le monde", "fr").with_subtitles().build()
+   segments = tts.get_subtitle_segments()

@@ -22,11 +22,13 @@ classifiers = [
     "Topic :: Multimedia :: Sound/Audio :: Speech",
 ]
 dependencies = [
+    "beautifulsoup4",
     "google-cloud-texttospeech",
     "google-genai",
     "langchain",
     "langchain-core",
     "langchain-google-genai",
+    "lxml",
     "moviepy>=1.0.3",
     "numpy>=1.20.0",
     "Pillow>=8.0.0",

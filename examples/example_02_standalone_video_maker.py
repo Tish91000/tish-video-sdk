@@ -8,8 +8,8 @@ Demonstrates two flows:
 - A TTS-narrated video (VideoBuilder.from_single_image_with_tts), reusing the
   same .env / voice_packs.json configuration as example_01_standalone_tts.py.
 
-Subtitle support isn't available yet (see source/api/video_maker.rst) -- it
-returns once the subtitles module lands.
+See example_03_video_text_segments.py for timed text overlays (titles,
+captions) and example_04_subtitles.py for subtitle generation.
 """
 import os
 

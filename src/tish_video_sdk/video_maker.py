@@ -8,7 +8,9 @@ from moviepy import (
     ImageClip,
     ColorClip,
     CompositeVideoClip,
+    CompositeAudioClip,
     concatenate_videoclips,
+    concatenate_audioclips,
 )
 from moviepy.video.fx import MaskColor, Loop
 import numpy as np
@@ -37,6 +39,7 @@ class DummyLogger:
         return kwargs.get("chunk", [])
 
 from .tts import TTSBuilder
+from .subtitles import get_subtitle_pack
 from typing import Optional, List, Dict, Tuple, Union
 import tempfile
 
@@ -138,6 +141,7 @@ class VideoBuilder:
         self._duration: Optional[float] = None
         self._image_filepath: Optional[str] = None
         self._image_segments: Optional[List[Dict]] = None
+        self._advanced_segments: Optional[List[Dict]] = None
         self._tts_builder: Optional[TTSBuilder] = None
         self._tts_text: Optional[str] = None
         self._language_code: Optional[str] = None
@@ -150,9 +154,16 @@ class VideoBuilder:
         self._overlay_video_path: Optional[str] = None
         self._overlay_video_config: Optional[Dict] = None
 
-        # Timed text segments (titles, captions, ...) configuration
+        # Timed text segments (titles, captions, subtitles, ...) configuration
         self._text_segments: Optional[List[Dict]] = None
         self._text_style: Optional[TextStyle] = None
+        self._enable_tts_subtitles: bool = False
+
+        # Two-level caching for from_multi_segments_advanced() (TTS audio +
+        # subtitles per segment, complete video clips, background music)
+        self._audio_cache: Dict[str, Dict] = {}
+        self._video_cache: Dict[str, VideoFileClip] = {}
+        self._bgm_cache: Dict[str, AudioFileClip] = {}
 
     @classmethod
     def from_single_image_with_audio(cls, image_filepath: str, audio_filepath: str, fps: int = DEFAULT_FPS, width: int = 1080, height: int = 1920) -> 'VideoBuilder':
@@ -238,6 +249,91 @@ class VideoBuilder:
         builder = cls(fps, width, height)
         builder._image_segments = image_segments
         return builder
+
+    @classmethod
+    def from_multi_segments_advanced(cls, segments: List[Dict], fps: int = DEFAULT_FPS, width: int = 1080, height: int = 1920) -> 'VideoBuilder':
+        """
+        Create a VideoBuilder from advanced segments with intelligent repetition handling.
+
+        Segment structure::
+
+            {
+                "image": "path/to/image.png",
+                "text": "Text to be spoken",
+                "bgm": "path/to/background_music.wav",  # optional
+                "repeat": 10,  # optional, default 1
+                "language_code": "fr",  # optional, defaults to 'fr'
+                "provider": "gemini",  # optional, pins TTS to one provider for this segment
+            }
+
+        Optimizations:
+
+        - TTS audio and subtitles are cached and reused for identical text + language combinations
+        - Complete video clips are cached and reused for identical text + language + image combinations
+        - Background music is handled per segment
+
+        Args:
+            segments (List[Dict]): List of advanced segment configurations.
+            fps (int): Frames per second for the output video.
+
+        Returns:
+            VideoBuilder: Configured VideoBuilder instance.
+        """
+        builder = cls(fps, width, height)
+        builder._advanced_segments = segments
+        return builder
+
+    def with_subtitles(self, segments: List[Dict], style: Optional[TextStyle] = None) -> 'VideoBuilder':
+        """
+        Add pre-supplied subtitle/caption segments to the video (e.g. from
+        tish_video_sdk.subtitles.SubtitleBuilder, or hand-written). Thin
+        wrapper over with_text_segments() -- subtitles are just timed text.
+
+        Args:
+            segments (List[Dict]): Timed segments, see with_text_segments().
+            style (TextStyle, optional): Styling to apply. Defaults to the
+                configured SubtitlePack for this builder's language (see
+                tish_video_sdk.subtitles), falling back to TextStyle() if
+                none is configured or no language is known.
+
+        Returns:
+            VideoBuilder: Self for method chaining.
+        """
+        return self.with_text_segments(segments, style or self._default_subtitle_style())
+
+    def with_tts_subtitles(self, style: Optional[TextStyle] = None) -> 'VideoBuilder':
+        """
+        Enable automatic subtitle generation from TTS audio via forced
+        alignment (see tish_video_sdk.subtitles.SubtitleBuilder). Only works
+        when using TTS for audio generation. Segments aren't known until the
+        TTS builder has synthesized audio, so build() extracts them from
+        self._tts_builder and applies them via with_text_segments() once
+        available.
+
+        Args:
+            style (TextStyle, optional): Styling to apply. Defaults to the
+                configured SubtitlePack for this builder's language (see
+                tish_video_sdk.subtitles), falling back to TextStyle() if
+                none is configured.
+
+        Returns:
+            VideoBuilder: Self for method chaining.
+        """
+        self._enable_tts_subtitles = True
+        self._text_style = style or self._default_subtitle_style()
+        return self
+
+    def _default_subtitle_style(self) -> Optional[TextStyle]:
+        """Resolve a language-appropriate default style from a configured
+        SubtitlePack, when this builder's language is known. Returns None
+        (letting with_text_segments() fall back to bare TextStyle()) if no
+        language is known yet or no pack is configured for it -- e.g. manual
+        subtitles supplied without ever going through TTS."""
+        if self._language_code:
+            pack = get_subtitle_pack(self._language_code)
+            if pack:
+                return TextStyle(**pack.style_kwargs())
+        return None
 
     def with_overlay_image(self, image_path: str, position: Union[tuple, str] = ('center', 0.7), width: Optional[int] = None, height: Optional[int] = None, corner_radius: int = 0) -> 'VideoBuilder':
         """
@@ -329,7 +425,9 @@ class VideoBuilder:
                 return None
 
         # Step 2: Create the base video clip
-        if self._image_segments:
+        if self._advanced_segments:
+            self.video_clip = self._create_advanced_segments_video_clip()
+        elif self._image_segments:
             self.video_clip = self._create_multi_image_video_clip()
         elif self._image_filepath:
             self.video_clip = self._create_single_image_video_clip()
@@ -530,8 +628,19 @@ class VideoBuilder:
                  print(f"Failed to add overlay video: {e}")
                  traceback.print_exc()
 
-        # Step 2.7: Add timed text segments (titles, captions, ...) if configured
-        if self._text_segments:
+        # Step 2.65: Extract TTS subtitle segments if enabled (advanced segments
+        # already carry their own per-segment subtitles via _create_segment_video_clip)
+        if self._enable_tts_subtitles and self._tts_builder and not self._advanced_segments:
+            print("Extracting TTS subtitles...")
+            tts_segments = self._tts_builder.get_subtitle_segments()
+            if tts_segments:
+                self._text_segments = tts_segments
+                print(f"Extracted {len(tts_segments)} TTS subtitle segments.")
+            else:
+                print("No TTS subtitle segments found.")
+
+        # Step 2.7: Add timed text segments (titles, captions, subtitles, ...) if configured
+        if self._text_segments and not self._advanced_segments:
             print("Adding text segments to video clip...")
             text_clip = self._overlay_text_segments_on_single_clip(self.video_clip, self._text_segments)
 
@@ -709,6 +818,9 @@ class VideoBuilder:
                 self._language_code,
                 self._provider
             )
+
+            if self._enable_tts_subtitles:
+                self._tts_builder = self._tts_builder.with_subtitles()
 
             # Build TTS
             result = self._tts_builder.build()
@@ -1364,3 +1476,274 @@ class VideoBuilder:
                 except:
                     pass
             return None
+
+    def _create_advanced_segments_video_clip(self) -> Optional[VideoFileClip]:
+        """Create a video clip from advanced segments with intelligent caching."""
+        if not self._advanced_segments:
+            print("Error: No advanced segments provided.")
+            return None
+
+        print(f"Creating advanced multi-segment video from {len(self._advanced_segments)} segments...")
+
+        # STEP 1: Expand segments with repetitions
+        expanded_segments = self._expand_segments_with_repetitions()
+        if not expanded_segments:
+            print("Error: No valid expanded segments.")
+            return None
+
+        print(f"Expanded to {len(expanded_segments)} total segments after repetitions.")
+
+        # STEP 2: Process each expanded segment (including repetitions)
+        video_clips = []
+        current_time = 0.0
+
+        for i, segment in enumerate(expanded_segments):
+            print(f"Processing segment {i+1}/{len(expanded_segments)}...")
+
+            # Create video clip for this segment (uses cached TTS)
+            clip = self._create_segment_video_clip(segment, current_time)
+            if clip:
+                video_clips.append(clip)
+                current_time += clip.duration
+            else:
+                print(f"Warning: Failed to create clip for segment {i+1}")
+
+        if not video_clips:
+            print("Error: No valid video clips created from advanced segments.")
+            return None
+
+        try:
+            print("Concatenating video clips...")
+            final_video = concatenate_videoclips(video_clips, method="compose")
+            print("Advanced segments video clip created successfully.")
+            return final_video
+
+        except Exception as e:
+            print(f"Error concatenating advanced segment clips: {e}")
+            # Clean up clips in case of error
+            for clip in video_clips:
+                try:
+                    clip.close()
+                except:
+                    pass
+            return None
+
+    def _expand_segments_with_repetitions(self) -> List[Dict]:
+        """
+        Repetition Handling with Two-Level Caching:
+
+        1. AUDIO CACHE: Caches TTS audio + subtitles by text+language
+        2. VIDEO CACHE: Caches complete video clips by audio+image combination
+        3. EXPANSION: Creates multiple copies of each segment based on repeat count
+        4. OPTIMIZATION: Reuses cached audio and video clips when possible
+
+        Cache Keys:
+        - Audio Cache Key: "text|language_code"
+        - Video Cache Key: "text|language_code|image_path"
+        """
+        expanded = []
+
+        for segment in self._advanced_segments:
+            repeat_count = segment.get('repeat', 1)  # Default to 1 if not specified
+
+            # Validate segment
+            if not segment.get('image') or not segment.get('text'):
+                print(f"Warning: Segment missing required 'image' or 'text': {segment}")
+                continue
+
+            # Create cache keys for two-level caching
+            text = segment['text']
+            language_code = segment.get('language_code', 'fr')
+            image_path = segment['image']
+
+            audio_cache_key = f"{text}|{language_code}"
+            video_cache_key = f"{text}|{language_code}|{image_path}"
+
+            # Level 1: Pre-generate TTS audio if not cached
+            if audio_cache_key not in self._audio_cache:
+                print(f"Generating TTS audio for: '{text[:50]}...' (language: {language_code})")
+                tts_result = self._generate_and_cache_audio(text, language_code, segment.get('provider'))
+                if not tts_result:
+                    print(f"Warning: TTS generation failed for segment with text: '{text[:50]}...'")
+                    continue
+            else:
+                print(f"Using cached TTS audio for: '{text[:50]}...'")
+
+            # Add repeated segments (CORE REPETITION LOGIC)
+            for rep in range(repeat_count):
+                expanded_segment = segment.copy()
+                expanded_segment['_audio_cache_key'] = audio_cache_key
+                expanded_segment['_video_cache_key'] = video_cache_key
+                expanded_segment['_repetition'] = rep + 1
+                expanded.append(expanded_segment)
+
+        return expanded
+
+    def _generate_and_cache_audio(self, text: str, language_code: str, provider: Optional[str] = None) -> bool:
+        """Generate TTS audio and subtitles, then cache them in audio cache."""
+        audio_cache_key = f"{text}|{language_code}"
+
+        if audio_cache_key in self._audio_cache:
+            return True
+
+        try:
+            # Create TTS builder
+            tts_builder = TTSBuilder.from_text(text, language_code, provider)
+            tts_builder = tts_builder.with_subtitles()  # Always enable subtitles for advanced segments
+
+            # Build TTS
+            result = tts_builder.build()
+            if result is None:
+                return False
+
+            # Create temporary audio file
+            temp_audio_dir = tempfile.gettempdir()
+            temp_audio_path = os.path.join(temp_audio_dir, f"audio_cache_{hash(audio_cache_key)}.wav")
+
+            saved_audio = tts_builder.save(temp_audio_path)
+            if not saved_audio:
+                return False
+
+            # Get subtitle segments
+            subtitle_segments = tts_builder.get_subtitle_segments()
+
+            # Cache the results in audio cache
+            self._audio_cache[audio_cache_key] = {
+                'audio_path': saved_audio,
+                'subtitle_segments': subtitle_segments,
+                'duration': AudioFileClip(saved_audio).duration if os.path.exists(saved_audio) else 0,
+                'tts_builder': tts_builder
+            }
+
+            print(f"Cached TTS audio for key: {audio_cache_key[:50]}...")
+            return True
+
+        except Exception as e:
+            print(f"Error generating TTS for audio cache key {audio_cache_key}: {e}")
+            return False
+
+    def _create_segment_video_clip(self, segment: Dict, start_time: float) -> Optional[VideoFileClip]:
+        """
+        Create a video clip for a single advanced segment with two-level caching.
+        Level 1: Check video cache (complete video clip)
+        Level 2: Use audio cache + create new video clip
+        """
+        try:
+            video_cache_key = segment['_video_cache_key']
+            audio_cache_key = segment['_audio_cache_key']
+
+            # Level 1: Check if complete video clip is cached
+            if video_cache_key in self._video_cache:
+                print(f"Using cached video clip for: {video_cache_key[:50]}...")
+                cached_clip = self._video_cache[video_cache_key]
+                # Create a copy of the cached clip for this instance
+                video_clip = cached_clip.copy()
+                repetition = segment.get('_repetition', 1)
+                print(f"Retrieved cached video clip (repetition {repetition}): duration {video_clip.duration:.2f}s")
+                return video_clip
+
+            # Level 2: Create new video clip using cached audio
+            audio_data = self._audio_cache.get(audio_cache_key)
+            if not audio_data:
+                print(f"Error: No cached audio data for key: {audio_cache_key}")
+                return None
+
+            # Create image clip
+            image_path = segment['image']
+            if not os.path.exists(image_path):
+                print(f"Error: Image file '{image_path}' does not exist.")
+                return None
+
+            # Get audio duration from cache
+            audio_duration = audio_data['duration']
+
+            # Create base video clip
+            image_clip = ImageClip(image_path).with_duration(audio_duration).with_fps(self.fps)
+
+            # Add TTS audio
+            audio_clip = AudioFileClip(audio_data['audio_path'])
+            video_clip = image_clip.with_audio(audio_clip)
+
+            # Add background music if specified
+            if segment.get('bgm'):
+                bgm_path = segment['bgm']
+                if os.path.exists(bgm_path):
+                    # Cache background music
+                    if bgm_path not in self._bgm_cache:
+                        self._bgm_cache[bgm_path] = AudioFileClip(bgm_path)
+
+                    bgm_clip = self._bgm_cache[bgm_path]
+
+                    # Adjust BGM duration to match video
+                    if bgm_clip.duration > audio_duration:
+                        bgm_clip = bgm_clip.subclipped(0, audio_duration)
+                    elif bgm_clip.duration < audio_duration:
+                        # Loop BGM if it's shorter
+                        loops_needed = int(audio_duration / bgm_clip.duration) + 1
+                        bgm_clip = concatenate_audioclips([bgm_clip] * loops_needed).subclipped(0, audio_duration)
+
+                    # Mix audio (reduce BGM volume)
+                    bgm_clip = bgm_clip.with_volume_scaled(0.3)  # 30% volume for BGM
+                    mixed_audio = CompositeAudioClip([audio_clip, bgm_clip])
+                    video_clip = video_clip.with_audio(mixed_audio)
+
+            # Add subtitles
+            subtitle_segments = audio_data['subtitle_segments']
+            if subtitle_segments:
+                # Create subtitle overlay
+                subtitled_clip = self._overlay_text_segments_on_single_clip(video_clip, subtitle_segments)
+                if subtitled_clip:
+                    video_clip.close()  # Clean up original
+                    video_clip = subtitled_clip
+
+            # Cache the complete video clip (without BGM for better reusability)
+            if not segment.get('bgm'):  # Only cache if no BGM to keep cache simple
+                self._video_cache[video_cache_key] = video_clip.copy()
+                print(f"Cached complete video clip for: {video_cache_key[:50]}...")
+
+            repetition = segment.get('_repetition', 1)
+            print(f"Created new video clip (repetition {repetition}): duration {audio_duration:.2f}s")
+            return video_clip
+
+        except Exception as e:
+            print(f"Error creating segment video clip: {e}")
+            return None
+
+    def cleanup_cache(self):
+        """Clean up cached resources from both cache levels."""
+        print("Cleaning up cached resources...")
+
+        # Clean up audio cache
+        for cache_key, audio_data in self._audio_cache.items():
+            try:
+                audio_path = audio_data.get('audio_path')
+                if audio_path and os.path.exists(audio_path):
+                    os.remove(audio_path)
+            except Exception as e:
+                print(f"Warning: Could not remove cached audio file: {e}")
+
+        # Clean up video cache
+        for cache_key, video_clip in self._video_cache.items():
+            try:
+                video_clip.close()
+            except Exception as e:
+                print(f"Warning: Could not close cached video clip: {e}")
+
+        # Clean up BGM cache
+        for bgm_path, bgm_clip in self._bgm_cache.items():
+            try:
+                bgm_clip.close()
+            except Exception as e:
+                print(f"Warning: Could not close BGM clip: {e}")
+
+        self._audio_cache.clear()
+        self._video_cache.clear()
+        self._bgm_cache.clear()
+        print("Two-level cache cleanup completed.")
+
+    def __del__(self):
+        """Destructor to ensure cleanup."""
+        try:
+            self.cleanup_cache()
+        except:
+            pass

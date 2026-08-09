@@ -207,3 +207,67 @@ class TestBuildGuards:
     def test_build_without_content_returns_none(self):
         builder = TTSBuilder("xx")
         assert builder.build() is None
+
+
+class TestSubtitleGeneration:
+    """MFA isn't installed in this environment, so these force the
+    time-based-splitting path (see tests/fake/test_subtitles.py for that
+    path's own dedicated tests) -- the point here is TTSBuilder's wiring
+    into SubtitleBuilder, not alignment accuracy."""
+
+    def test_with_subtitles_generates_segments_during_build(self, monkeypatch):
+        import tish_video_sdk.subtitles as subtitles_module
+        monkeypatch.setattr(subtitles_module, "USE_MFA_ALIGNMENT", False)
+
+        with patch("google.genai.Client") as mock_client_cls:
+            mock_client_cls.return_value.models.generate_content.return_value = _fake_gemini_response(_fake_pcm())
+
+            builder = TTSBuilder.from_text("Hello there. This is a test.", "xx", use_llm_ssml=False)
+            builder.with_subtitles()
+            result = builder.build()
+
+            assert result is builder
+            segments = builder.get_subtitle_segments()
+            assert segments
+            assert segments[0]['text'] == 'Hello there.'
+
+    def test_subtitle_failure_fails_the_whole_build(self, monkeypatch):
+        import tish_video_sdk.subtitles as subtitles_module
+        monkeypatch.setattr(subtitles_module, "USE_MFA_ALIGNMENT", False)
+        # No reference text distributable over zero-duration audio -> time-based
+        # splitting fails cleanly; simulate by forcing SubtitleBuilder.build() to fail.
+        monkeypatch.setattr(subtitles_module.SubtitleBuilder, "build", lambda self: None)
+
+        with patch("google.genai.Client") as mock_client_cls:
+            mock_client_cls.return_value.models.generate_content.return_value = _fake_gemini_response(_fake_pcm())
+
+            builder = TTSBuilder.from_text("Hello there.", "xx", use_llm_ssml=False)
+            builder.with_subtitles()
+            result = builder.build()
+
+            assert result is None
+
+    def test_without_subtitles_get_subtitle_segments_is_empty(self):
+        builder = TTSBuilder.from_text("Hello there.", "xx")
+        assert builder.get_subtitle_segments() == []
+
+    def test_cache_key_differs_with_and_without_subtitles(self, tmp_path, monkeypatch):
+        """Regression test: the hash TTSBuilder uses to key its cache used to
+        ignore whether subtitles were requested, so a build without subtitles
+        could cache-hit a later call with with_subtitles() (or vice versa),
+        silently returning audio with the wrong subtitle state."""
+        import tish_video_sdk.subtitles as subtitles_module
+        monkeypatch.setattr(subtitles_module, "USE_MFA_ALIGNMENT", False)
+
+        with patch("google.genai.Client") as mock_client_cls:
+            mock_client_cls.return_value.models.generate_content.return_value = _fake_gemini_response(_fake_pcm())
+
+            plain = TTSBuilder.from_text("Hello there.", "xx", use_llm_ssml=False, cache_dir=str(tmp_path))
+            plain.build()
+
+            with_subs = TTSBuilder.from_text("Hello there.", "xx", use_llm_ssml=False, cache_dir=str(tmp_path))
+            with_subs.with_subtitles()
+            with_subs.build()
+
+            assert with_subs.used_provider != "cache"
+            assert with_subs.get_subtitle_segments()

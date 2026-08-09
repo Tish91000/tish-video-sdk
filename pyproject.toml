@@ -10,6 +10,17 @@ readme = "README.md"
 license = {text = "MIT"}
 authors = [{name = "Cyril PETER"}]
 requires-python = ">=3.8"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
 dependencies = []
 
 [project.optional-dependencies]
@@ -20,6 +31,10 @@ dev = [
     "flake8>=3.8",
     "mypy>=0.910",
 ]
+
+[project.urls]
+Homepage = "https://github.com/Tish91000/tish-video-sdk"
+Repository = "https://github.com/Tish91000/tish-video-sdk"
 
 [tool.setuptools.packages.find]
 where = ["src"]

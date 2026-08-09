@@ -27,6 +27,9 @@ dependencies = [
     "langchain",
     "langchain-core",
     "langchain-google-genai",
+    "moviepy>=1.0.3",
+    "numpy>=1.20.0",
+    "Pillow>=8.0.0",
     "pydub",
     "python-dotenv",
 ]

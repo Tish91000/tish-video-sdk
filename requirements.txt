@@ -3,5 +3,8 @@ google-genai
 langchain
 langchain-core
 langchain-google-genai
+moviepy
+numpy
+Pillow
 pydub
 python-dotenv

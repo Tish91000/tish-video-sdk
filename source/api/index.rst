@@ -5,3 +5,4 @@ API Reference
    :maxdepth: 1
 
    tts
+   video_maker

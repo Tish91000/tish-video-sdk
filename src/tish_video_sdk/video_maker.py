@@ -12,7 +12,8 @@ from moviepy import (
 )
 from moviepy.video.fx import MaskColor, Loop
 import numpy as np
-from PIL import Image
+from dataclasses import dataclass
+from PIL import Image, ImageColor, ImageDraw, ImageFont
 import uuid # For unique temp filenames
 import traceback # Debugging
 
@@ -36,13 +37,75 @@ class DummyLogger:
         return kwargs.get("chunk", [])
 
 from .tts import TTSBuilder
-from typing import TYPE_CHECKING, Optional, List, Dict, Union
+from typing import Optional, List, Dict, Tuple, Union
 import tempfile
 
-if TYPE_CHECKING:
-    from .subtitles import SubtitleStyle
-
 DEFAULT_FPS = 24 # Frames per second for the output video
+
+# Font mapping for common families, resolved against the Windows Fonts folder.
+DEFAULT_FONT_SIZE = 50
+DEFAULT_TEXT_POSITION = (0.5, 0.5)  # Centered in the middle of the video
+DEFAULT_FONT_COLOR = 'black'
+DEFAULT_BG_COLOR = None  # Transparent background
+DEFAULT_STROKE_COLOR = 'black'
+DEFAULT_STROKE_WIDTH = 3
+DEFAULT_FONT_FAMILY = 'Arial-Bold'
+DEFAULT_BOX_SIZE = (0.8, None)
+
+# Specific font mapping for certain languages (e.g., Tamil requires a different font)
+FONT_FAMILY_BY_LANGUAGE = {
+    'ta': 'Nirmala-UI-&-Nirmala-UI-Bold-&-Nirmala-UI-Semilight-&-Nirmala-Text-&-Nirmala-Text-Bold-&-Nirmala-Text-Semilight',
+    'default': DEFAULT_FONT_FAMILY,
+}
+
+
+@dataclass
+class TextStyle:
+    """Styling for a block of text (or word-timed text segments) rendered onto
+    a video via :meth:`VideoBuilder.with_text_segments` -- font, color,
+    position, and the animated per-word highlight used for karaoke-style
+    captions. Not tied to subtitles specifically: a single-segment title/caption
+    uses the same style class."""
+    font_size: int = DEFAULT_FONT_SIZE
+    font_color: str = DEFAULT_FONT_COLOR
+    font_family: str = DEFAULT_FONT_FAMILY
+    stroke_color: str = DEFAULT_STROKE_COLOR
+    stroke_width: int = DEFAULT_STROKE_WIDTH
+    bg_color: Optional[str] = DEFAULT_BG_COLOR
+    text_position: Tuple = DEFAULT_TEXT_POSITION
+    box_size: Tuple[Optional[float], Optional[float]] = DEFAULT_BOX_SIZE
+    highlight_color: str = '#FFD700'
+    timing_offset: float = 0.0
+    language_code: str = 'en'
+
+    def get_font_for_language(self) -> str:
+        """Return appropriate font family for the language."""
+        return FONT_FAMILY_BY_LANGUAGE.get(self.language_code, self.font_family)
+
+    def __post_init__(self):
+        if self.font_size <= 0:
+            raise ValueError("font_size must be positive")
+        if self.stroke_width < 0:
+            raise ValueError("stroke_width must be non-negative")
+        if not isinstance(self.text_position, (tuple, list)) or len(self.text_position) != 2:
+            raise ValueError("text_position must be a tuple/list of 2 elements")
+        if not isinstance(self.box_size, (tuple, list)) or len(self.box_size) != 2:
+            raise ValueError("box_size must be a tuple/list of 2 elements")
+        if self.font_color:
+            try:
+                ImageColor.getrgb(self.font_color)
+            except ValueError:
+                raise ValueError(f"Invalid font_color: {self.font_color}")
+        if self.bg_color is not None:
+            try:
+                ImageColor.getrgb(self.bg_color)
+            except ValueError:
+                raise ValueError(f"Invalid bg_color: {self.bg_color}")
+        if self.highlight_color:
+            try:
+                ImageColor.getrgb(self.highlight_color)
+            except ValueError:
+                raise ValueError(f"Invalid highlight_color: {self.highlight_color}")
 
 
 class VideoBuilder:
@@ -86,6 +149,10 @@ class VideoBuilder:
         # Overlay Video configuration
         self._overlay_video_path: Optional[str] = None
         self._overlay_video_config: Optional[Dict] = None
+
+        # Timed text segments (titles, captions, ...) configuration
+        self._text_segments: Optional[List[Dict]] = None
+        self._text_style: Optional[TextStyle] = None
 
     @classmethod
     def from_single_image_with_audio(cls, image_filepath: str, audio_filepath: str, fps: int = DEFAULT_FPS, width: int = 1080, height: int = 1920) -> 'VideoBuilder':
@@ -223,6 +290,27 @@ class VideoBuilder:
             'react_to_audio': react_to_audio,
             'pulse_magnitude': pulse_magnitude
         }
+        return self
+
+    def with_text_segments(self, segments: List[Dict], style: Optional[TextStyle] = None) -> 'VideoBuilder':
+        """
+        Overlay one or more timed text segments (titles, captions, karaoke-style
+        word-highlighted text, ...) onto the video.
+
+        Args:
+            segments (List[Dict]): Each segment is a dict with 'text', 'start',
+                'end' (seconds), and optionally 'words' -- a list of
+                {'word', 'start', 'end'} dicts for per-word highlight timing.
+                A single-segment list spanning the whole video is the "title"
+                use case; multiple segments with 'words' is how subtitles are
+                rendered (see tish_video_sdk.subtitles).
+            style (TextStyle, optional): Styling to apply. Defaults to TextStyle().
+
+        Returns:
+            VideoBuilder: Self for method chaining.
+        """
+        self._text_segments = segments
+        self._text_style = style
         return self
 
     def build(self) -> Optional[VideoFileClip]:
@@ -441,6 +529,19 @@ class VideoBuilder:
              except Exception as e:
                  print(f"Failed to add overlay video: {e}")
                  traceback.print_exc()
+
+        # Step 2.7: Add timed text segments (titles, captions, ...) if configured
+        if self._text_segments:
+            print("Adding text segments to video clip...")
+            text_clip = self._overlay_text_segments_on_single_clip(self.video_clip, self._text_segments)
+
+            if text_clip is None:
+                print("Failed to add text segments to video clip.")
+                self.video_clip.close()
+                return None
+
+            self.video_clip = text_clip
+            print("Text segments added successfully.")
 
         print("Video generation completed successfully.")
         try:
@@ -846,6 +947,418 @@ class VideoBuilder:
             print(f"Error concatenating video clips: {e}")
             # Clean up clips in case of error
             for clip in video_clips:
+                try:
+                    clip.close()
+                except:
+                    pass
+            return None
+
+    def _get_font_path(self, font_name: str) -> str:
+        """Find the font file path on Windows."""
+        # Clean font name
+        cleaned = font_name.split('&')[0].strip() # Handle language specific combinations if any
+
+        # Try standard Windows Fonts folder
+        win_dir = os.environ.get('SystemRoot', 'C:\\Windows')
+        fonts_dir = os.path.join(win_dir, 'Fonts')
+
+        if not os.path.exists(fonts_dir):
+            # Fallback if WINDIR not found or not Windows
+            return font_name # return as-is, PIL might fail but we catch it
+
+        # Font mapping dictionary for common families
+        font_map = {
+            'arial': 'arial.ttf',
+            'arial-bold': 'arialbd.ttf',
+            'arial_bold': 'arialbd.ttf',
+            'helvetica': 'arial.ttf',
+            'nirmala-ui': 'Nirmala.ttf',
+            'nirmala': 'Nirmala.ttf',
+            'nirmala-ui-bold': 'Nirmalab.ttf',
+            'nirmala-bold': 'Nirmalab.ttf',
+            'courier': 'cour.ttf',
+            'courier-new': 'cour.ttf',
+            'times-new-roman': 'times.ttf',
+            'georgia': 'georgia.ttf',
+            'impact': 'impact.ttf',
+        }
+
+        name_lower = cleaned.lower()
+
+        # Check direct mapping
+        if name_lower in font_map:
+            path = os.path.join(fonts_dir, font_map[name_lower])
+            if os.path.exists(path):
+                return path
+            # Fallback to .ttc if direct mapping specifies .ttf but only .ttc exists
+            if path.lower().endswith('.ttf'):
+                ttc_path = path[:-4] + '.ttc'
+                if os.path.exists(ttc_path):
+                    return ttc_path
+
+        # Try appending extensions
+        for ext in ['.ttf', '.otf', '.ttc', '.TTF', '.OTF', '.TTC']:
+            path = os.path.join(fonts_dir, cleaned + ext)
+            if os.path.exists(path):
+                return path
+            path = os.path.join(fonts_dir, name_lower + ext)
+            if os.path.exists(path):
+                return path
+
+        # Search the directory for containing matches
+        try:
+            for f in os.listdir(fonts_dir):
+                if f.lower().startswith(name_lower) and f.lower().endswith(('.ttf', '.otf', '.ttc')):
+                    return os.path.join(fonts_dir, f)
+        except Exception:
+            pass
+
+        # Default fallback
+        return os.path.join(fonts_dir, 'arial.ttf')
+
+    def _render_text_frame_pil(self, width: int, height: int, words: List[Dict], active_word_idx: Optional[int], style: TextStyle, has_word_timestamps: bool = True) -> Image.Image:
+        """
+        Renders a single frame of text using PIL.
+        Supports word-level highlighting, wrapping, outline/stroke, and rounded-corner background box.
+        Dynamically adapts font size to fit the available space.
+        """
+        if not has_word_timestamps:
+            active_word_idx = None
+
+        # 1. Create transparent image
+        img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+
+        # 2. Get font path
+        font_path = self._get_font_path(style.get_font_for_language())
+
+        # 3. Load font and calculate layout constraints (potentially scaling down)
+        max_w = int(width * (style.box_size[0] or 0.8))
+        max_h = int(height * (style.box_size[1] or 0.35))
+
+        current_font_size = style.font_size
+        min_font_size = 12
+        font = None
+        lines = []
+        line_height = 0
+        total_height = 0
+
+        while current_font_size >= min_font_size:
+            try:
+                font = ImageFont.truetype(font_path, current_font_size)
+                is_default = False
+            except Exception as e:
+                print(f"Warning: Failed to load font {font_path}, falling back to default. Error: {e}")
+                font = ImageFont.load_default()
+                is_default = True
+
+            # Helper to get size of a word
+            def get_word_size(text):
+                if hasattr(draw, 'textbbox'):
+                    bbox = draw.textbbox((0, 0), text, font=font)
+                    return bbox[2] - bbox[0], bbox[3] - bbox[1]
+                elif hasattr(font, 'getbbox'):
+                    bbox = font.getbbox(text)
+                    return bbox[2] - bbox[0], bbox[3] - bbox[1]
+                else:
+                    return font.getsize(text)
+
+            # Wrap words into lines to stay within the screen margin
+            lines = []
+            current_line = []
+            current_line_w = 0
+
+            for idx, w_dict in enumerate(words):
+                word_text = w_dict.get('word', '').strip()
+                if not word_text:
+                    continue
+
+                # Measure word with trailing space
+                measure_text = word_text + " "
+                w_width, w_height = get_word_size(measure_text)
+
+                is_active = (active_word_idx is not None and idx == active_word_idx)
+
+                if current_line_w + w_width > max_w and current_line:
+                    # Wrap to next line
+                    lines.append(current_line)
+                    current_line = [(w_dict, is_active, idx, w_width)]
+                    current_line_w = w_width
+                else:
+                    current_line.append((w_dict, is_active, idx, w_width))
+                    current_line_w += w_width
+
+            if current_line:
+                lines.append(current_line)
+
+            if lines:
+                _, sample_h = get_word_size("Ay")
+                line_height = int(sample_h * 1.3)
+                total_height = len(lines) * line_height
+            else:
+                line_height = 0
+                total_height = 0
+
+            # If default font or total_height fits within max_h, or we are at min_font_size, we stop
+            if is_default or total_height <= max_h or current_font_size <= min_font_size:
+                break
+
+            current_font_size -= 2
+
+        # Use final font size for background box padding
+        resolved_font_size = current_font_size
+
+        if not lines:
+            return img
+
+        # 6. Determine text position on the screen
+        pos_x, pos_y = style.text_position
+        box_w = int(width * (style.box_size[0] or 0.8))
+
+        # Resolve x coordinate (finding center_x)
+        if isinstance(pos_x, str):
+            pos_x_lower = pos_x.lower()
+            if pos_x_lower == 'left':
+                center_x = box_w // 2
+            elif pos_x_lower == 'right':
+                center_x = width - box_w // 2
+            else: # 'center'
+                center_x = width // 2
+        elif isinstance(pos_x, (int, float)):
+            # If relative float
+            if 0.0 <= pos_x <= 1.0:
+                if pos_x == 0.5:
+                    center_x = width // 2
+                elif pos_x < 0.4:
+                    # e.g., 0.1 is the left margin of an 80% wide box
+                    center_x = int(width * (pos_x + (style.box_size[0] or 0.8) / 2))
+                else:
+                    center_x = int(width * pos_x)
+            else:
+                # Absolute pixel value
+                if pos_x < width * 0.4:
+                    center_x = int(pos_x + box_w // 2)
+                else:
+                    center_x = int(pos_x)
+        else:
+            center_x = width // 2
+
+        # Resolve y coordinate (finding top of the text block)
+        if isinstance(pos_y, str):
+            pos_y_lower = pos_y.lower()
+            if pos_y_lower == 'top':
+                y_start = int(height * 0.05) # 5% top margin
+            elif pos_y_lower == 'center':
+                y_start = (height - total_height) // 2
+            elif pos_y_lower == 'bottom':
+                y_start = height - total_height - int(height * 0.05) # 5% bottom margin
+            else:
+                y_start = height - total_height - int(height * 0.05)
+        elif isinstance(pos_y, (int, float)):
+            # If relative float
+            if 0.0 <= pos_y <= 1.0:
+                y_start = int(height * pos_y)
+            else:
+                y_start = int(pos_y)
+        else:
+            y_start = height - total_height - int(height * 0.05)
+
+        # Calculate line positions and widths
+        line_info = [] # List of (line, line_w, line_x, line_y)
+        curr_y = y_start
+
+        for line in lines:
+            line_w = sum(item[3] for item in line)
+            line_x = center_x - (line_w // 2)
+            line_info.append((line, line_w, line_x, curr_y))
+            curr_y += line_height
+
+        # 7. Draw background box if style.bg_color is specified
+        if style.bg_color:
+            try:
+                bg_color_rgba = ImageColor.getrgb(style.bg_color)
+            except Exception:
+                bg_color_rgba = (0, 0, 0, 128) # Default 50% opacity black
+
+            box_padding_x = int(resolved_font_size * 0.5)
+            box_padding_y = int(resolved_font_size * 0.25)
+
+            max_line_w = max(info[1] for info in line_info)
+            box_w = max_line_w + 2 * box_padding_x
+            box_h = total_height + 2 * box_padding_y
+
+            box_left = center_x - (box_w // 2)
+            box_top = y_start - box_padding_y
+            box_right = box_left + box_w
+            box_bottom = y_start + total_height + box_padding_y
+
+            corner_radius = int(resolved_font_size * 0.25)
+            draw.rounded_rectangle(
+                [(box_left, box_top), (box_right, box_bottom)],
+                radius=corner_radius,
+                fill=bg_color_rgba
+            )
+
+        # 8. Draw each word
+        highlight_color = getattr(style, 'highlight_color', '#FFD700')
+        font_color = style.font_color or 'white'
+        stroke_color = style.stroke_color or 'black'
+        stroke_width = style.stroke_width or 0
+
+        for line, line_w, line_x, line_y in line_info:
+            curr_x = line_x
+            for w_dict, is_active, idx, w_width in line:
+                word_text = w_dict.get('word', '')
+
+                # Active word highlight color, else normal font color
+                color = highlight_color if is_active else font_color
+
+                # Draw the word
+                draw.text(
+                    (curr_x, line_y),
+                    word_text + " ",
+                    fill=color,
+                    font=font,
+                    stroke_width=stroke_width,
+                    stroke_fill=stroke_color
+                )
+
+                curr_x += w_width
+
+        return img
+
+    def _overlay_text_segments_on_single_clip(self, video_clip: VideoFileClip, segments: List[Dict]) -> Optional[VideoFileClip]:
+        """Overlay timed text segments on a single video clip using PIL rendering.
+
+        Each segment becomes one or more per-word-interval ImageClips (so a
+        segment with word-level timestamps animates a highlighted "active
+        word" as it's read); a segment with no 'words' renders as static text
+        for its whole start/end span."""
+        print(f"DEBUG: _overlay_text_segments_on_single_clip called with {len(segments)} segments")
+        if not segments:
+            print("DEBUG: No text segments provided, returning original clip")
+            return video_clip
+
+        style = self._text_style or TextStyle()
+
+        text_clips = []
+
+        try:
+            for i, segment in enumerate(segments):
+                text_content = segment.get('text', '').replace('\n', ' ').strip()
+                offset = getattr(style, 'timing_offset', 0.0)
+                seg_start = segment.get('start', 0.0) + offset
+                seg_end = segment.get('end', 0.0) + offset
+
+                if not text_content or seg_start >= seg_end:
+                    continue
+
+                words = segment.get('words', [])
+                has_word_timestamps = bool(words)
+                if not words:
+                    # Split plain text into words to allow wrapping, distributing start/end times evenly
+                    word_list = text_content.split()
+                    duration = seg_end - seg_start
+                    if word_list:
+                        per_word_duration = duration / len(word_list)
+                        words = [
+                            {
+                                'word': w,
+                                'start': seg_start + idx * per_word_duration,
+                                'end': seg_start + (idx + 1) * per_word_duration
+                            }
+                            for idx, w in enumerate(word_list)
+                        ]
+                    else:
+                        words = [{'word': text_content, 'start': seg_start, 'end': seg_end}]
+                else:
+                    # Shift word timestamps by timing_offset
+                    words = [
+                        {
+                            'word': w.get('word', ''),
+                            'start': w.get('start', 0.0) + offset,
+                            'end': w.get('end', 0.0) + offset
+                        }
+                        for w in words
+                    ]
+
+                # Ensure words are sorted by start time
+                words = sorted(words, key=lambda x: x.get('start', 0.0))
+
+                # Determine time boundaries for sub-intervals within the segment
+                boundaries = [seg_start]
+                for w in words:
+                    w_start = w.get('start', 0.0)
+                    w_end = w.get('end', 0.0)
+                    # Keep boundaries within segment bounds
+                    w_start = max(seg_start, min(w_start, seg_end))
+                    w_end = max(seg_start, min(w_end, seg_end))
+                    boundaries.append(w_start)
+                    boundaries.append(w_end)
+                boundaries.append(seg_end)
+
+                # Remove duplicates and sort
+                boundaries = sorted(list(set(boundaries)))
+
+                # Generate a clip for each sub-interval
+                for idx in range(len(boundaries) - 1):
+                    t1 = boundaries[idx]
+                    t2 = boundaries[idx + 1]
+                    dur = t2 - t1
+
+                    if dur < 0.01:
+                        continue
+
+                    # Find which word index is active during this interval
+                    mid = (t1 + t2) / 2.0
+                    active_idx = None
+                    for w_idx, w in enumerate(words):
+                        if w.get('start', 0.0) <= mid <= w.get('end', 0.0):
+                            active_idx = w_idx
+                            break
+
+                    # Render frame using PIL
+                    frame_img = self._render_text_frame_pil(video_clip.w, video_clip.h, words, active_idx, style, has_word_timestamps)
+
+                    # Convert to RGBA numpy array
+                    frame_arr = np.array(frame_img)
+
+                    rgb_arr = frame_arr[:, :, :3]
+                    alpha_arr = frame_arr[:, :, 3] / 255.0  # Normalize alpha to 0.0-1.0
+
+                    # Create the ImageClip and its transparency mask
+                    img_clip = ImageClip(rgb_arr)
+                    mask_clip = ImageClip(alpha_arr, is_mask=True)
+                    img_clip = img_clip.with_mask(mask_clip)
+
+                    # Set time parameters
+                    img_clip = img_clip.with_start(t1).with_duration(dur)
+                    text_clips.append(img_clip)
+
+        except Exception as e:
+            print(f"Error rendering PIL text frames: {e}")
+            traceback.print_exc()
+            for clip in text_clips:
+                try:
+                    clip.close()
+                except:
+                    pass
+            return None
+
+        print(f"DEBUG: Created {len(text_clips)} text clips")
+        if not text_clips:
+            return video_clip
+
+        try:
+            print("DEBUG: Compositing video with text clips...")
+            final_clip = CompositeVideoClip([video_clip] + text_clips)
+            if video_clip.audio:
+                final_clip = final_clip.with_audio(video_clip.audio)
+            return final_clip
+
+        except Exception as e:
+            print(f"Error compositing video with text segments: {e}")
+            for clip in text_clips:
                 try:
                     clip.close()
                 except:

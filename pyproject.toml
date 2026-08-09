@@ -21,7 +21,15 @@ classifiers = [
     "Topic :: Multimedia :: Video",
     "Topic :: Multimedia :: Sound/Audio :: Speech",
 ]
-dependencies = []
+dependencies = [
+    "google-cloud-texttospeech",
+    "google-genai",
+    "langchain",
+    "langchain-core",
+    "langchain-google-genai",
+    "pydub",
+    "python-dotenv",
+]
 
 [project.optional-dependencies]
 dev = [
@@ -41,3 +49,9 @@ where = ["src"]
 
 [tool.setuptools.package-dir]
 "" = "src"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: makes real network/API calls and needs real credentials; skips itself when those aren't available. Exclude with `pytest -m \"not integration\"`.",
+]

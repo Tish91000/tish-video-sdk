@@ -1,0 +1,31 @@
+[
+  {
+    "provider": "gemini",
+    "language_code": "fr",
+    "voice_name": "Fenrir",
+    "credentials": "<your Gemini API key>",
+    "model": "gemini-2.5-flash-preview-tts",
+    "synthesis_character_limit": 4800,
+    "max_sentence_character_limit": 800
+  },
+  {
+    "provider": "google_cloud",
+    "language_code": "fr",
+    "tts_language_code": "fr-FR",
+    "voice_name": "fr-FR-Neural2-G",
+    "credentials": "./service-account/your-fr-credentials.json",
+    "ssml_credentials": "<your Gemini API key, for this VoicePack's own SSML conversion step>",
+    "ssml_model": "gemini-2.5-flash",
+    "synthesis_character_limit": 4800,
+    "max_sentence_character_limit": 800
+  },
+  {
+    "provider": "gemini",
+    "language_code": "en",
+    "voice_name": "Puck",
+    "credentials": "<your Gemini API key>",
+    "model": "gemini-2.5-flash-preview-tts",
+    "synthesis_character_limit": 4800,
+    "max_sentence_character_limit": 800
+  }
+]

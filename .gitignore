@@ -2,6 +2,11 @@
 .env
 .env.*
 !*.template
+service-account/
+language_config.json
+voice_packs.json
+voice_packs.*.json
+!voice_packs.example.json
 
 # Caches
 __pycache__/

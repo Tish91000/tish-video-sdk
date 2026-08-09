@@ -1,0 +1,7 @@
+google-cloud-texttospeech
+google-genai
+langchain
+langchain-core
+langchain-google-genai
+pydub
+python-dotenv

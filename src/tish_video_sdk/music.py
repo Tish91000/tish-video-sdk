@@ -5,7 +5,7 @@ a Gemini-driven text mood analysis, or a direct file path -- then mixes it
 under a speech track via pydub. The set of moods and the mood-analysis prompt
 are plain content, not core SDK behavior: MusicManager ships generic,
 domain-neutral defaults and lets a project override both via a mood-config
-JSON file (see music_moods.example.json), the same MUSIC_MOODS_PATH-style
+JSON file (see configuration/music_moods.example.json), the same MUSIC_MOODS_PATH-style
 override every other per-project config in this SDK uses (TTS_VOICE_PACKS_PATH,
 SUBTITLE_PACKS_PATH).
 
@@ -28,6 +28,7 @@ from typing import Dict, List, Optional, Tuple, Union
 from pydub import AudioSegment
 
 from .internal.providers import music_packs
+from . import reasoning
 
 DEFAULT_MOODS: Dict[str, str] = {
     "calm": "Peaceful, reflective, reassuring -- suited to quiet or contemplative moments.",
@@ -80,7 +81,7 @@ Respond with only the tag (or two, comma-separated), nothing else. For example: 
 
 def _load_mood_config(mood_packs_path: Optional[str]) -> Tuple[Dict[str, str], str]:
     """Load {moods, prompt_template} from mood_packs_path (see
-    music_moods.example.json for the shape), falling back to the built-in
+    configuration/music_moods.example.json for the shape), falling back to the built-in
     generic defaults for whichever of the two the file doesn't override.
     mood_packs_path itself falls back to the MUSIC_MOODS_PATH env var, then
     to the defaults alone when neither is set."""
@@ -102,7 +103,7 @@ class MusicManager:
                  bgm_directory: str = "./music/bgm",
                  default_music_file: str = "./music/bgm/default_music.mp3",
                  default_mood: str = "calm",
-                 gemini_api_key: str = "",
+                 language_code: Optional[str] = None,
                  mood_packs_path: Optional[str] = None,
                  jamendo_client_id: str = ""):
         """
@@ -110,12 +111,15 @@ class MusicManager:
             bgm_directory: Directory of mood subfolders containing background music files.
             default_music_file: Fallback music file when no mood match is found.
             default_mood: Mood used when no mood can be determined.
-            gemini_api_key: Gemini API key for mood analysis. Mood analysis falls
-                back to default_mood when omitted.
+            language_code: Language whose ReasoningPack chain (REASONING_PACKS_PATH,
+                see reasoning.py) mood analysis calls through. No credential is
+                held on this object -- each call looks its own up via
+                reasoning.generate(). Mood analysis falls back to default_mood
+                when this isn't given.
             mood_packs_path: Path to a JSON file overriding the available moods
                 and/or the mood-analysis prompt template (see
-                music_moods.example.json). Falls back to the MUSIC_MOODS_PATH
-                env var, then to generic built-in defaults.
+                configuration/music_moods.example.json). Falls back to the
+                MUSIC_MOODS_PATH env var, then to generic built-in defaults.
             jamendo_client_id: Jamendo API client_id (free, see
                 https://devportal.jamendo.com/). When set, a mood with no
                 usable local track downloads one free, Creative-Commons track
@@ -126,16 +130,11 @@ class MusicManager:
         self.bgm_directory = bgm_directory
         self.default_music_file = default_music_file
         self.default_mood = default_mood
-        self.gemini_api_key = gemini_api_key
+        self.language_code = language_code
         self.jamendo_client_id = jamendo_client_id or os.getenv("JAMENDO_CLIENT_ID", "")
 
         self.available_moods, self._mood_prompt_template = _load_mood_config(mood_packs_path)
         self._loudness_cache: Dict[str, float] = {}
-
-        self._client = None
-        if self.gemini_api_key:
-            from google import genai
-            self._client = genai.Client(api_key=self.gemini_api_key)
 
     def _load_audio(self, file_path: str) -> AudioSegment:
         """
@@ -262,39 +261,32 @@ class MusicManager:
             The determined mood (one of self.available_moods' keys).
             Returns default_mood if the mood cannot be determined or an error occurs.
         """
-        if not self._client:
-            print("Warning: No Gemini API key provided. Using default mood.")
+        if not self.language_code:
+            print("Warning: No language_code provided. Using default mood.")
             return self.default_mood
 
         # Prepare the mood descriptions for the prompt
         mood_descriptions = "\n".join([f"- {mood.capitalize()}: {desc}" for mood, desc in self.available_moods.items()])
         mood_list = ", ".join(self.available_moods.keys())
 
-        prompt = self._mood_prompt_template.format(
-            mood_list=mood_list, mood_descriptions=mood_descriptions, text=text
-        )
-
-        # Call the Gemini API
-        print("Calling Gemini API for mood analysis...")
+        print("Calling reasoning module for mood analysis...")
         try:
-            response = self._client.models.generate_content(
-                model="gemini-2.5-flash-lite",
-                contents=prompt,
+            raw_mood = reasoning.generate(
+                self.language_code,
+                self._mood_prompt_template,
+                {"mood_list": mood_list, "mood_descriptions": mood_descriptions, "text": text},
             )
+        except reasoning.ReasoningError as e:
+            print(f"Error calling reasoning module for mood analysis: {e}")
+            return self.default_mood
 
-            # Clean up the response to get a single word
-            determined_mood = (response.text or "").strip().lower()
+        determined_mood = raw_mood.strip().lower()
 
-            # Validate the response
-            if determined_mood in self.available_moods:
-                print(f"Mood determined: {determined_mood}")
-                return determined_mood
-            else:
-                print(f"Warning: Gemini returned an unexpected mood: '{determined_mood}'")
-                return self.default_mood
-
-        except Exception as e:
-            print(f"Error calling Gemini API for mood analysis: {e}")
+        if determined_mood in self.available_moods:
+            print(f"Mood determined: {determined_mood}")
+            return determined_mood
+        else:
+            print(f"Warning: reasoning module returned an unexpected mood: '{determined_mood}'")
             return self.default_mood
 
     def select_audio_music(self, mood: str, duration: int, search_query: Optional[str] = None,
@@ -438,7 +430,7 @@ class MusicManager:
         if extra and extra != mood:
             if len(extra) <= _MAX_TAG_QUERY_CHARS:
                 tags.append(extra)
-            elif self._client:
+            elif self.language_code:
                 keywords = self._gemini_extract_search_keywords(extra)
                 if keywords:
                     tags.append(keywords)
@@ -446,23 +438,20 @@ class MusicManager:
         return ", ".join(tags)
 
     def _gemini_extract_search_keywords(self, text: str) -> Optional[str]:
-        """Ask Gemini for one (occasionally two) music genre/mood tag
-        describing text -- specific enough to correspond to the text, but
-        common enough to actually have matches in a real music library, not
-        an invented or overly narrow phrase. Returns None on any failure so
-        the caller can fall back to something safer."""
-        prompt = _KEYWORD_EXTRACTION_PROMPT_TEMPLATE.format(text=text)
+        """Ask the reasoning module for one (occasionally two) music
+        genre/mood tag describing text -- specific enough to correspond to
+        the text, but common enough to actually have matches in a real
+        music library, not an invented or overly narrow phrase. Returns
+        None on any failure so the caller can fall back to something safer."""
         try:
-            response = self._client.models.generate_content(
-                model="gemini-2.5-flash-lite",
-                contents=prompt,
-            )
-            keywords = (response.text or "").strip()
+            keywords = reasoning.generate(
+                self.language_code, _KEYWORD_EXTRACTION_PROMPT_TEMPLATE, {"text": text}
+            ).strip()
             if keywords:
-                print(f"Gemini condensed the search text into a tag: '{keywords}'")
+                print(f"Reasoning module condensed the search text into a tag: '{keywords}'")
             return keywords or None
-        except Exception as e:
-            print(f"Gemini search-keyword extraction failed: {e}")
+        except reasoning.ReasoningError as e:
+            print(f"Reasoning module search-keyword extraction failed: {e}")
             return None
 
     def _fetch_from_jamendo(self, mood: str, duration: int, mood_directory: str,

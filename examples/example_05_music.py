@@ -8,13 +8,15 @@ and mood-tagged background tracks with pydub's tone generator.
 Demonstrates five flows:
 - Mood-name selection: music_input="calm" picks straight from bgm_directory,
   no Gemini call involved.
-- Text-driven mood analysis: reference_text_for_mood asks Gemini to pick the
-  mood, gated on GEMINI_API_KEY being configured (see ../.env.template) --
-  skipped otherwise, same pattern as the other examples' provider checks.
+- Text-driven mood analysis: reference_text_for_mood asks Gemini (via the
+  reasoning module -- see ../CONTEXT.md's reasoning.generate()/embed() entry)
+  to pick the mood, gated on REASONING_PACKS_PATH being configured with an
+  "en" entry (see ../.env.template) -- skipped otherwise, same pattern as the
+  other examples' provider checks.
 - Jamendo fallback: mixing for "meditative", a mood with no local placeholder
   track, gated on JAMENDO_CLIENT_ID being configured -- skipped otherwise.
 - Gemini + Jamendo combined: reference_text_for_mood describing a scene with
-  no local placeholder mood, gated on both GEMINI_API_KEY and
+  no local placeholder mood, gated on both REASONING_PACKS_PATH and
   JAMENDO_CLIENT_ID. Gemini classifies the mood *and* -- since the reference
   text is long prose, not a short tag -- condenses it into one well-chosen
   search tag for Jamendo (see MusicManager._refine_search_query); the
@@ -96,6 +98,11 @@ def main():
     _make_placeholder_bgm(bgm_directory, "calm", freq=330)
     _make_placeholder_bgm(bgm_directory, "joy", freq=440)
 
+    # Mood analysis needs a REASONING_PACKS_PATH configured with an "en"
+    # entry (see ../CONTEXT.md's ReasoningPack entry) -- no raw key is ever
+    # passed to MusicManager directly.
+    language_code = "en" if os.getenv("REASONING_PACKS_PATH") else None
+
     manager = MusicManager(
         bgm_directory=bgm_directory,
         # A real, already-generated fallback -- the class default
@@ -103,7 +110,7 @@ def main():
         # so if a Jamendo search below genuinely finds nothing, mixing has
         # something real to fall back to instead of crashing on a missing file.
         default_music_file=os.path.join(bgm_directory, "calm", "calm_placeholder.wav"),
-        gemini_api_key=os.getenv("GEMINI_API_KEY", ""),
+        language_code=language_code,
         jamendo_client_id=os.getenv("JAMENDO_CLIENT_ID", ""),
     )
 
@@ -115,14 +122,14 @@ def main():
     )
 
     print("--- Text-driven mood analysis ---")
-    if manager.gemini_api_key:
+    if manager.language_code:
         manager.add_background_music(
             speech_path,
             os.path.join(output_dir, "speech_with_analyzed_bgm.wav"),
             reference_text_for_mood=SPEECH_TEXT_FOR_MOOD,
         )
     else:
-        print("No GEMINI_API_KEY configured; skipping mood analysis.")
+        print("No REASONING_PACKS_PATH configured; skipping mood analysis.")
 
     print("--- Jamendo fallback (mood with no local track) ---")
     if manager.jamendo_client_id:
@@ -135,14 +142,14 @@ def main():
         print("No JAMENDO_CLIENT_ID configured; skipping Jamendo fallback.")
 
     print("--- Gemini + Jamendo combined (mood classification, then keyword-condensed search) ---")
-    if manager.gemini_api_key and manager.jamendo_client_id:
+    if manager.language_code and manager.jamendo_client_id:
         manager.add_background_music(
             speech_path,
             os.path.join(output_dir, "speech_with_gemini_jamendo_bgm.wav"),
             reference_text_for_mood=ADVENTURE_TEXT_FOR_MOOD,
         )
     else:
-        print("Need both GEMINI_API_KEY and JAMENDO_CLIENT_ID configured; skipping.")
+        print("Need both REASONING_PACKS_PATH and JAMENDO_CLIENT_ID configured; skipping.")
 
     print("--- Explicit pool growth (fetch_from_jamendo) + random local pick ---")
     if manager.jamendo_client_id:

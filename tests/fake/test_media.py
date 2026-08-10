@@ -16,6 +16,7 @@ from tish_video_sdk.media import ImageConverter, ImageFetcher, ImageGenerator, I
 from tish_video_sdk.internal.providers.media_packs import (
     DuckDuckGoMediaPack, MediaPack, MediaResult, PexelsMediaPack, WikipediaMediaPack,
 )
+from tish_video_sdk.internal.providers.reasoning_packs import ReasoningAPIError
 
 
 @pytest.fixture(autouse=True)
@@ -550,6 +551,43 @@ class TestSearchOrGenerate:
                 generator.search_or_generate("a quiet forest", "forest_scene", prefer_generation=True)
 
         mock_search.assert_not_called()
+
+
+class TestSearchOrGenerateKeywordExtraction:
+    """Covers _gemini_extract_search_keywords() going through the reasoning
+    module (see CONTEXT.md's reasoning.generate()/embed() entry) instead of
+    ImageGenerator's own api_key-based client -- gated on language_code,
+    not api_key, since keyword extraction is a text call unrelated to
+    Imagen's own credential."""
+
+    def test_no_language_code_falls_back_to_raw_text(self, tmp_path):
+        generator = ImageGenerator(api_key="", output_directory=str(tmp_path))
+
+        with patch("tish_video_sdk.reasoning.generate") as mock_generate, \
+             patch.object(generator.image_searcher, "search", return_value=["/cache/a.jpg", "/cache/b.jpg"]) as mock_search:
+            generator.search_or_generate("a quiet forest", "forest_scene", min_search_results=2)
+
+        mock_generate.assert_not_called()
+        mock_search.assert_called_once_with("a quiet forest", max_results=3)
+
+    def test_language_code_configured_uses_extracted_keywords(self, tmp_path):
+        generator = ImageGenerator(api_key="", output_directory=str(tmp_path), language_code="en")
+
+        with patch("tish_video_sdk.reasoning.generate", return_value="forest, mist") as mock_generate, \
+             patch.object(generator.image_searcher, "search", return_value=["/cache/a.jpg", "/cache/b.jpg"]) as mock_search:
+            generator.search_or_generate("a quiet forest", "forest_scene", min_search_results=2)
+
+        mock_generate.assert_called_once()
+        mock_search.assert_called_once_with("forest, mist", max_results=3)
+
+    def test_reasoning_error_falls_back_to_raw_text(self, tmp_path):
+        generator = ImageGenerator(api_key="", output_directory=str(tmp_path), language_code="en")
+
+        with patch("tish_video_sdk.reasoning.generate", side_effect=ReasoningAPIError("gemini is down")), \
+             patch.object(generator.image_searcher, "search", return_value=["/cache/a.jpg", "/cache/b.jpg"]) as mock_search:
+            generator.search_or_generate("a quiet forest", "forest_scene", min_search_results=2)
+
+        mock_search.assert_called_once_with("a quiet forest", max_results=3)
 
 
 class TestGenerateVariations:

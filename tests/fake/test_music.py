@@ -4,7 +4,6 @@ Run with: pytest tests/fake
 """
 import json
 import os
-from types import SimpleNamespace
 from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
@@ -14,16 +13,13 @@ from pydub.generators import Sine
 
 from tish_video_sdk.music import MusicManager
 from tish_video_sdk.internal.providers.music_packs import JamendoTrack
+from tish_video_sdk.internal.providers.reasoning_packs import ReasoningAPIError
 
 
 def _write_tone(path, duration_ms):
     tone = Sine(440).to_audio_segment(duration=duration_ms)
     tone.export(str(path), format="wav")
     return tone
-
-
-def _fake_gemini_text_response(text):
-    return SimpleNamespace(text=text)
 
 
 @pytest.fixture(autouse=True)
@@ -37,29 +33,23 @@ def _no_ambient_jamendo_client_id(monkeypatch):
 
 
 class TestMoodAnalysis:
-    def test_no_api_key_returns_default_mood(self):
-        manager = MusicManager(default_mood="calm", gemini_api_key="")
+    def test_no_language_code_returns_default_mood(self):
+        manager = MusicManager(default_mood="calm")
         assert manager.get_mood_from_text("some text") == "calm"
 
     def test_valid_mood_returned(self):
-        with patch("google.genai.Client") as mock_client_cls:
-            mock_client_cls.return_value.models.generate_content.return_value = _fake_gemini_text_response("joy")
-
-            manager = MusicManager(gemini_api_key="fake-key")
+        with patch("tish_video_sdk.reasoning.generate", return_value="joy"):
+            manager = MusicManager(language_code="en")
             assert manager.get_mood_from_text("Everyone cheered and celebrated") == "joy"
 
     def test_unexpected_mood_falls_back_to_default(self):
-        with patch("google.genai.Client") as mock_client_cls:
-            mock_client_cls.return_value.models.generate_content.return_value = _fake_gemini_text_response("furious")
-
-            manager = MusicManager(default_mood="calm", gemini_api_key="fake-key")
+        with patch("tish_video_sdk.reasoning.generate", return_value="furious"):
+            manager = MusicManager(default_mood="calm", language_code="en")
             assert manager.get_mood_from_text("...") == "calm"
 
     def test_api_error_falls_back_to_default(self):
-        with patch("google.genai.Client") as mock_client_cls:
-            mock_client_cls.return_value.models.generate_content.side_effect = RuntimeError("gemini is down")
-
-            manager = MusicManager(default_mood="calm", gemini_api_key="fake-key")
+        with patch("tish_video_sdk.reasoning.generate", side_effect=ReasoningAPIError("gemini is down")):
+            manager = MusicManager(default_mood="calm", language_code="en")
             assert manager.get_mood_from_text("...") == "calm"
 
     def test_default_moods_are_generic_not_domain_specific(self):
@@ -71,15 +61,12 @@ class TestMoodAnalysis:
             assert "bibl" not in description.lower()
 
     def test_prompt_sent_to_gemini_has_no_domain_framing(self):
-        with patch("google.genai.Client") as mock_client_cls:
-            mock_generate = mock_client_cls.return_value.models.generate_content
-            mock_generate.return_value = _fake_gemini_text_response("calm")
-
-            manager = MusicManager(gemini_api_key="fake-key")
+        with patch("tish_video_sdk.reasoning.generate", return_value="calm") as mock_generate:
+            manager = MusicManager(language_code="en")
             manager.get_mood_from_text("some text")
 
-            sent_prompt = mock_generate.call_args.kwargs["contents"]
-            assert "bibl" not in sent_prompt.lower()
+            template, values = mock_generate.call_args.args[1], mock_generate.call_args.args[2]
+            assert "bibl" not in template.format(**values).lower()
 
     def test_mood_packs_path_overrides_moods_and_prompt(self, tmp_path):
         config_path = tmp_path / "custom_moods.json"
@@ -89,16 +76,13 @@ class TestMoodAnalysis:
             encoding="utf-8",
         )
 
-        with patch("google.genai.Client") as mock_client_cls:
-            mock_generate = mock_client_cls.return_value.models.generate_content
-            mock_generate.return_value = _fake_gemini_text_response("tense")
-
-            manager = MusicManager(gemini_api_key="fake-key", mood_packs_path=str(config_path))
+        with patch("tish_video_sdk.reasoning.generate", return_value="tense") as mock_generate:
+            manager = MusicManager(language_code="en", mood_packs_path=str(config_path))
             assert manager.available_moods == {"tense": "Suspenseful and anxious."}
             assert manager.get_mood_from_text("something ominous") == "tense"
 
-            sent_prompt = mock_generate.call_args.kwargs["contents"]
-            assert sent_prompt.startswith("Custom prompt.")
+            template, values = mock_generate.call_args.args[1], mock_generate.call_args.args[2]
+            assert template.format(**values).startswith("Custom prompt.")
 
     def test_music_moods_path_env_var_is_used_when_no_explicit_path(self, tmp_path, monkeypatch):
         config_path = tmp_path / "env_moods.json"
@@ -186,7 +170,7 @@ class TestJamendoFallback:
             result = manager.select_audio_music("calm", duration=2)
 
         # No explicit search_query given -- effective_query defaults to the
-        # mood's own (long) description, but with no gemini_api_key
+        # mood's own (long) description, but with no language_code
         # configured to condense it, _refine_search_query falls back to the
         # bare mood name itself (a working Jamendo tag, unlike raw prose).
         mock_search.assert_called_once_with("calm", 2, "fake-client-id")
@@ -291,14 +275,12 @@ class TestJamendoFallback:
         )
         assert len(long_text) > 40  # otherwise this wouldn't exercise refinement at all
 
-        with patch("google.genai.Client") as mock_client_cls, \
+        with patch("tish_video_sdk.reasoning.generate", return_value="ambient, dreamy, seaside"), \
              patch("tish_video_sdk.music.music_packs.search_track", return_value=_fake_track()) as mock_search, \
              patch("tish_video_sdk.music.music_packs.download_track", side_effect=_fake_download_track):
-            mock_client_cls.return_value.models.generate_content.return_value = \
-                _fake_gemini_text_response("ambient, dreamy, seaside")
 
             manager = MusicManager(
-                bgm_directory=str(tmp_path / "bgm"), jamendo_client_id="fake-client-id", gemini_api_key="fake-key",
+                bgm_directory=str(tmp_path / "bgm"), jamendo_client_id="fake-client-id", language_code="en",
             )
             manager.select_audio_music("calm", duration=2, search_query=long_text)
 
@@ -319,28 +301,27 @@ class TestJamendoFallback:
     def test_long_query_falls_back_to_mood_name_when_gemini_extraction_fails(self, tmp_path):
         long_text = "A " + "very " * 20 + "long piece of reference text."
 
-        with patch("google.genai.Client") as mock_client_cls, \
+        with patch("tish_video_sdk.reasoning.generate", side_effect=ReasoningAPIError("gemini is down")), \
              patch("tish_video_sdk.music.music_packs.search_track", return_value=_fake_track()) as mock_search, \
              patch("tish_video_sdk.music.music_packs.download_track", side_effect=_fake_download_track):
-            mock_client_cls.return_value.models.generate_content.side_effect = RuntimeError("gemini is down")
 
             manager = MusicManager(
-                bgm_directory=str(tmp_path / "bgm"), jamendo_client_id="fake-client-id", gemini_api_key="fake-key",
+                bgm_directory=str(tmp_path / "bgm"), jamendo_client_id="fake-client-id", language_code="en",
             )
             manager.select_audio_music("dark", duration=2, search_query=long_text)
 
         mock_search.assert_called_once_with("dark", 2, "fake-client-id")
 
     def test_short_query_passes_through_unchanged_even_with_gemini_configured(self, tmp_path):
-        with patch("google.genai.Client") as mock_client_cls, \
+        with patch("tish_video_sdk.reasoning.generate") as mock_generate, \
              patch("tish_video_sdk.music.music_packs.search_track", return_value=_fake_track()) as mock_search, \
              patch("tish_video_sdk.music.music_packs.download_track", side_effect=_fake_download_track):
             manager = MusicManager(
-                bgm_directory=str(tmp_path / "bgm"), jamendo_client_id="fake-client-id", gemini_api_key="fake-key",
+                bgm_directory=str(tmp_path / "bgm"), jamendo_client_id="fake-client-id", language_code="en",
             )
             manager.select_audio_music("dark", duration=2, search_query="stormy seas")
 
-            mock_client_cls.return_value.models.generate_content.assert_not_called()
+            mock_generate.assert_not_called()
 
         # Combined -- mood itself, plus the short query as-is (no Gemini needed).
         mock_search.assert_called_once_with("dark, stormy seas", 2, "fake-client-id")
@@ -354,7 +335,7 @@ class TestJamendoFallback:
 
         with patch("tish_video_sdk.music.music_packs.search_track", return_value=_fake_track()) as mock_search, \
              patch("tish_video_sdk.music.music_packs.download_track", side_effect=_fake_download_track):
-            # No gemini_api_key configured -- mood classification falls back
+            # No language_code configured -- mood classification falls back
             # to default_mood ("calm") without needing Gemini mocked too.
             result = manager.get_music_path(reference_text="A wild chase through the mountains", duration=2)
 
@@ -508,10 +489,8 @@ class TestGetMusicPath:
         track = mood_dir / "track.wav"
         _write_tone(track, 2000)
 
-        with patch("google.genai.Client") as mock_client_cls:
-            mock_client_cls.return_value.models.generate_content.return_value = _fake_gemini_text_response("joy")
-
-            manager = MusicManager(bgm_directory=str(tmp_path / "bgm"), gemini_api_key="fake-key")
+        with patch("tish_video_sdk.reasoning.generate", return_value="joy"):
+            manager = MusicManager(bgm_directory=str(tmp_path / "bgm"), language_code="en")
             assert manager.get_music_path(reference_text="Everyone cheered!", duration=1) == str(track)
 
     def test_no_input_falls_back_to_default_mood(self, tmp_path):

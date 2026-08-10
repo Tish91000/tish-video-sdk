@@ -1,0 +1,12 @@
+[
+  {
+    "provider": "gemini",
+    "language_code": "fr",
+    "credentials": "<your Gemini API key>"
+  },
+  {
+    "provider": "gemini",
+    "language_code": "en",
+    "credentials": "<your Gemini API key>"
+  }
+]

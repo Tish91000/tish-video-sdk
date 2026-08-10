@@ -36,6 +36,7 @@ import requests
 from PIL import Image
 
 from .internal.providers.media_packs import DuckDuckGoMediaPack, MediaPack, PexelsMediaPack, WikipediaMediaPack
+from . import reasoning
 
 DEFAULT_SOURCES = ["pexels", "duckduckgo", "wikipedia"]
 
@@ -321,11 +322,13 @@ class ImageGenerator:
         aspect_ratio: str = "9:16",
         prompt_template: str = DEFAULT_IMAGE_PROMPT_TEMPLATE,
         image_searcher: Optional[ImageSearcher] = None,
+        language_code: Optional[str] = None,
     ):
         """
         Args:
-            api_key: Google GenAI API key. Falls back to GEMINI_API_KEY,
-                then GOOGLE_API_KEY. generate_image raises if none is set.
+            api_key: Google GenAI API key for Imagen generation itself.
+                Falls back to GEMINI_API_KEY, then GOOGLE_API_KEY.
+                generate_image raises if none is set.
             output_directory: Directory generated images are saved into.
             model_name: Imagen model name.
             aspect_ratio: Aspect ratio for generated images.
@@ -335,6 +338,12 @@ class ImageGenerator:
             image_searcher: ImageSearcher used by search_or_generate() to
                 try a web search before generating. Defaults to a new
                 ImageSearcher(cache_dir=output_directory).
+            language_code: Language whose ReasoningPack chain (REASONING_PACKS_PATH,
+                see reasoning.py) search_or_generate()'s keyword-extraction
+                call goes through -- a separate concern from api_key above,
+                which is only for the actual Imagen generation. Keyword
+                extraction just falls back to using the raw text as the
+                search query when this isn't given.
         """
         self.api_key = api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
         self.output_directory = output_directory
@@ -342,6 +351,7 @@ class ImageGenerator:
         self.aspect_ratio = aspect_ratio
         self.prompt_template = prompt_template
         self.image_searcher = image_searcher or ImageSearcher(cache_dir=output_directory)
+        self.language_code = language_code
 
         self._client = None
         if self.api_key:
@@ -442,21 +452,19 @@ class ImageGenerator:
         return images
 
     def _gemini_extract_search_keywords(self, text: str) -> Optional[str]:
-        """Ask Gemini for a short image-search query capturing text's key
-        visual subject. Returns None on any failure (including no api_key)
-        so the caller can fall back to using text itself as the query."""
-        if not self._client:
+        """Ask the reasoning module for a short image-search query capturing
+        text's key visual subject. Returns None on any failure (including no
+        language_code) so the caller can fall back to using text itself as
+        the query."""
+        if not self.language_code:
             return None
-        prompt = _SEARCH_KEYWORD_PROMPT_TEMPLATE.format(text=text)
         try:
-            response = self._client.models.generate_content(
-                model="gemini-2.5-flash-lite",
-                contents=prompt,
-            )
-            keywords = (response.text or "").strip()
+            keywords = reasoning.generate(
+                self.language_code, _SEARCH_KEYWORD_PROMPT_TEMPLATE, {"text": text}
+            ).strip()
             return keywords or None
-        except Exception as e:
-            print(f"Gemini search-keyword extraction failed: {e}")
+        except reasoning.ReasoningError as e:
+            print(f"Reasoning module search-keyword extraction failed: {e}")
             return None
 
     def generate_variations(self, base_prompt: str, output_name: str,

@@ -7,15 +7,36 @@ Run with: pytest tests/fake
 import json
 import os
 import pickle
+from datetime import datetime
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tish_video_sdk import date_managment
+from tish_video_sdk import publisher as publisher_module
 from tish_video_sdk.publisher import Publisher
 from tish_video_sdk.internal.providers import publisher_packs
 from tish_video_sdk.internal.providers.publisher_packs import (
     InstagramPublisherPack, PublisherPack, YouTubePublisherPack, _build_google_service, _detect_credential_type,
 )
+
+
+class _FixedNow(datetime):
+    """Stand-in for datetime with a frozen .now()/.today(), real everything
+    else -- mirrors test_date_managment.py's _FixedDatetime. Patched into
+    publisher.py's own `datetime` import for Publisher.next_unpublished_date's
+    datetime.now() call, and/or date_managment's for get_offset_date's
+    datetime.today() call, depending on which code path a test exercises."""
+
+    _fixed_now = datetime(2024, 3, 10)
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls._fixed_now
+
+    @classmethod
+    def today(cls):
+        return cls._fixed_now
 
 
 # --------------------------------------------------------------------------
@@ -184,6 +205,64 @@ class TestYouTubePublisherPack:
 
         mock_build.assert_not_called()
 
+    def test_publish_video_content_date_and_hour_computes_schedule(self, tmp_path):
+        video = tmp_path / "video.mp4"
+        video.write_bytes(b"data")
+        pack = YouTubePublisherPack(str(tmp_path / "secret.json"))
+
+        fake_request = MagicMock()
+        fake_request.next_chunk.return_value = (None, {"id": "abc123"})
+        fake_service = MagicMock()
+        fake_service.videos.return_value.insert.return_value = fake_request
+
+        with patch.object(publisher_packs, "_build_google_service", return_value=fake_service), \
+             patch("googleapiclient.http.MediaFileUpload"):
+            pack.publish_video(
+                str(video), title="t",
+                content_date=datetime(2024, 3, 15), hour_of_day=21, utc_offset_hours=-2, publish_minute=5,
+            )
+
+        body = fake_service.videos.return_value.insert.call_args.kwargs["body"]
+        assert body["status"]["publishAt"] == "2024-03-15T19:05:00.000Z"
+
+    def test_publish_video_explicit_datetime_takes_precedence_over_content_date(self, tmp_path):
+        video = tmp_path / "video.mp4"
+        video.write_bytes(b"data")
+        pack = YouTubePublisherPack(str(tmp_path / "secret.json"))
+
+        fake_request = MagicMock()
+        fake_request.next_chunk.return_value = (None, {"id": "x"})
+        fake_service = MagicMock()
+        fake_service.videos.return_value.insert.return_value = fake_request
+
+        with patch.object(publisher_packs, "_build_google_service", return_value=fake_service), \
+             patch("googleapiclient.http.MediaFileUpload"):
+            pack.publish_video(
+                str(video), title="t",
+                publish_year=2025, publish_month=1, publish_day=1, publish_hour=0,
+                content_date=datetime(2024, 3, 15), hour_of_day=21,
+            )
+
+        body = fake_service.videos.return_value.insert.call_args.kwargs["body"]
+        assert body["status"]["publishAt"] == "2025-01-01T00:00:00.000Z"
+
+    def test_publish_video_content_date_without_hour_of_day_leaves_unscheduled(self, tmp_path):
+        video = tmp_path / "video.mp4"
+        video.write_bytes(b"data")
+        pack = YouTubePublisherPack(str(tmp_path / "secret.json"))
+
+        fake_request = MagicMock()
+        fake_request.next_chunk.return_value = (None, {"id": "x"})
+        fake_service = MagicMock()
+        fake_service.videos.return_value.insert.return_value = fake_request
+
+        with patch.object(publisher_packs, "_build_google_service", return_value=fake_service), \
+             patch("googleapiclient.http.MediaFileUpload"):
+            pack.publish_video(str(video), title="t", content_date=datetime(2024, 3, 15))
+
+        body = fake_service.videos.return_value.insert.call_args.kwargs["body"]
+        assert "publishAt" not in body["status"]
+
     def test_add_comment(self, tmp_path):
         pack = YouTubePublisherPack(str(tmp_path / "secret.json"))
         pack.service = MagicMock()
@@ -346,3 +425,83 @@ class TestPublisher:
             publisher.publish_to_instagram("video.mp4", caption="hello")
 
         mock_publish.assert_called_once_with("video.mp4", caption="hello")
+
+
+# --------------------------------------------------------------------------
+# Publisher publish-date tracking (next_unpublished_date/mark_published)
+# --------------------------------------------------------------------------
+
+class TestPublisherPublishDateTracking:
+    def test_language_code_none_by_default(self):
+        publisher = Publisher(youtube_client_secret_filepath="secret.json")
+        assert publisher.language_code is None
+
+    def test_for_language_sets_language_code(self, tmp_path):
+        packs_path = tmp_path / "publisher_packs.json"
+        packs_path.write_text(json.dumps([
+            {"language_code": "fr", "provider": "youtube", "client_secret_filepath": "secret.json"},
+        ]))
+        with patch.dict(os.environ, {"PUBLISHER_PACKS_PATH": str(packs_path)}):
+            publisher_module._ALL_PUBLISHER_PACK_ENTRIES = None
+            try:
+                publisher = Publisher.for_language("fr")
+            finally:
+                publisher_module._ALL_PUBLISHER_PACK_ENTRIES = None
+        assert publisher.language_code == "fr"
+
+    def test_next_unpublished_date_without_language_code_raises(self):
+        publisher = Publisher()
+        with pytest.raises(ValueError, match="language_code"):
+            publisher.next_unpublished_date()
+
+    def test_mark_published_without_language_code_raises(self):
+        publisher = Publisher()
+        with pytest.raises(ValueError, match="language_code"):
+            publisher.mark_published(datetime(2024, 3, 15))
+
+    def test_next_unpublished_date_no_prior_publish_uses_today_plus_offset(self, monkeypatch, tmp_path):
+        # base_date stays None on a fresh tracker, so get_offset_date falls
+        # back to date_managment's own datetime.today() -- that's the one to freeze here.
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(date_managment, "datetime", _FixedNow)
+        publisher = Publisher(language_code="fr")
+        assert publisher.next_unpublished_date(offset_days=1) == datetime(2024, 3, 11)
+
+    def test_next_unpublished_date_and_mark_published_round_trip(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(publisher_module, "datetime", _FixedNow)
+        publisher = Publisher(language_code="fr")
+        publisher.mark_published(datetime(2024, 3, 11))
+        # last_published=3/11, offset_days=1 -> intended=3/12, "today" (frozen)=3/10,
+        # 3/12 is not before 3/10 -> base_date=last_published_date=3/11 -> candidate=3/12.
+        assert publisher.next_unpublished_date(offset_days=1) == datetime(2024, 3, 12)
+
+    def test_next_unpublished_date_is_scoped_per_language(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(publisher_module, "datetime", _FixedNow)
+        monkeypatch.setattr(date_managment, "datetime", _FixedNow)
+        fr_publisher = Publisher(language_code="fr")
+        en_publisher = Publisher(language_code="en")
+        fr_publisher.mark_published(datetime(2024, 3, 20))
+        # en's own tracker file is untouched by fr's mark_published -- falls
+        # back to the no-prior-publish path (today + offset), not fr's state.
+        assert en_publisher.next_unpublished_date(offset_days=1) == datetime(2024, 3, 11)
+
+    def test_next_unpublished_date_skips_an_already_published_candidate(self, monkeypatch, tmp_path):
+        # offset_days=0 deliberately: with the offset_days >= 1 every real
+        # caller uses, base_date's own computation always already lands past
+        # the tracked date on the first try (see next_unpublished_date's
+        # docstring) -- 0 is the only way to actually force the
+        # skip-and-advance loop to run, to test it directly.
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(publisher_module, "datetime", _FixedNow)
+        publisher = Publisher(language_code="fr")
+        publisher.mark_published(datetime(2024, 3, 16))
+        assert publisher.next_unpublished_date(offset_days=0) == datetime(2024, 3, 17)
+
+    def test_next_unpublished_date_force_returns_already_published_candidate(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(publisher_module, "datetime", _FixedNow)
+        publisher = Publisher(language_code="fr")
+        publisher.mark_published(datetime(2024, 3, 16))
+        assert publisher.next_unpublished_date(offset_days=0, force=True) == datetime(2024, 3, 16)

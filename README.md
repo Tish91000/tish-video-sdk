@@ -11,6 +11,7 @@ A Python SDK for generating videos with narration, subtitles, music, and imagery
 - **Background music** selection and mixing, by mood name, Gemini-driven text analysis, or a direct file path
 - **Image search and generation**: multi-source web image/video search (Pexels, DuckDuckGo, Wikipedia) with local caching, AI image generation via Imagen (search-first with generation as fallback), and general-purpose aspect-ratio/compositing utilities
 - **Publishing**: video uploads to YouTube (OAuth, resumable upload, comments, thumbnails, trending/search) and Instagram Reels
+- **Date utilities**: date-offset formatting in several languages, plus a small publish-date tracker for scheduling loops
 
 ## Installation
 

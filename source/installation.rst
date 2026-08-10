@@ -24,7 +24,7 @@ The ``tts`` module reads its configuration from two places (see ``.env.template`
 * ``TTS_LANGUAGE_CODE`` — an optional *default* language for ``TTSBuilder()`` calls that
   don't pass ``language_code`` explicitly. One process can build ``TTSBuilder`` instances
   for multiple languages; this isn't a hard per-process constraint.
-* ``TTS_VOICE_PACKS_PATH`` — path to a JSON file (see ``voice_packs.example.json``) listing
+* ``TTS_VOICE_PACKS_PATH`` — path to a JSON file (see ``configuration/voice_packs.example.json``) listing
   every VoicePack (provider x language combination, e.g. Gemini or Google Cloud TTS) this
   process might use, including their credentials. Loaded once at import time.
 
@@ -38,7 +38,7 @@ The ``subtitles`` module (subtitle generation via forced alignment, used by
 ``TTSBuilder.with_subtitles()``/``VideoBuilder.with_tts_subtitles()``) reads:
 
 * ``SUBTITLE_PACKS_PATH`` — optional path to a JSON file (see
-  ``subtitle_packs.example.json``) listing SubtitlePacks: per-language MFA acoustic model
+  ``configuration/subtitle_packs.example.json``) listing SubtitlePacks: per-language MFA acoustic model
   name and default text styling. Built-in defaults already cover ``fr``/``en``/``es``/``ta``;
   this only needs to add languages or override a pack's model/styling.
 * ``MFA_ENV_PATH`` — root directory of the conda/mamba environment Montreal Forced Aligner
@@ -48,7 +48,7 @@ The ``subtitles`` module (subtitle generation via forced alignment, used by
 
 The ``music`` module (background-music selection and mixing, via ``MusicManager``) reads:
 
-* ``MUSIC_MOODS_PATH`` — optional path to a JSON file (see ``music_moods.example.json``)
+* ``MUSIC_MOODS_PATH`` — optional path to a JSON file (see ``configuration/music_moods.example.json``)
   overriding the available moods and/or the Gemini mood-analysis prompt template.
   ``MusicManager`` ships generic, domain-neutral moods and a generic prompt by default;
   this only needs to override them to match a specific project's ``bgm_directory`` mood
@@ -84,3 +84,10 @@ The ``publisher`` module (``Publisher``) reads:
   both, ``publisher.instagram`` is ``None``. ``INSTAGRAM_SESSION_FILE`` (optional) caches the
   login session so later runs can skip the login challenge when possible. Can also be passed
   directly as ``Publisher(instagram_username=..., instagram_password=..., instagram_session_file=...)``.
+
+The ``date_managment`` module (``DateFormatter``) reads:
+
+* ``DATE_MONTH_NAMES_PATH`` — optional path to a JSON file (see ``configuration/month_names.example.json``)
+  overriding the built-in per-language month-name tables. Built-in defaults already cover
+  en/fr/es/it/ta; this only needs to add languages or override names. Can also be passed
+  directly as ``DateFormatter(month_names_path=...)``.

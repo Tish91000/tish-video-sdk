@@ -16,10 +16,20 @@ common schema over that; publish_video()'s **kwargs pass straight through to
 the target PublisherPack, and platform-specific extras (add_comment,
 get_trending_videos, ...) are reached via the youtube/instagram pack
 properties directly rather than being reinvented here.
+
+Publisher also owns publish-date tracking (next_unpublished_date/
+mark_published, see ADR 0012): a consuming app's daily-content pipeline asks
+the same object it publishes through whether today's content was already
+handled, rather than reaching into date_managment.PublishingTracker directly.
+This is deliberately per-language, not per-platform -- it gates the whole
+day's content pipeline (fetch, TTS, video build, then whichever platforms are
+configured), not just one platform's upload step.
 """
 import os
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
+from .date_managment import PublishingTracker, get_offset_date
 from .internal.providers.publisher_packs import (
     InstagramPublisherPack, PublisherPack, YouTubePublisherPack, load_publisher_pack_entries,
 )
@@ -48,8 +58,16 @@ class Publisher:
 
     def __init__(self, youtube_client_secret_filepath: str = "", youtube_token_filename: str = "token.pickle",
                  youtube_category_id: int = 22, youtube_language_code: str = "en",
-                 instagram_username: str = "", instagram_password: str = "", instagram_session_file: str = ""):
+                 instagram_username: str = "", instagram_password: str = "", instagram_session_file: str = "",
+                 language_code: Optional[str] = None):
         self._packs: Dict[str, PublisherPack] = {}
+        # Independent of youtube_language_code (which only feeds YouTube's
+        # defaultLanguage snippet field): needed by next_unpublished_date()/
+        # mark_published() below, which are per-language regardless of which
+        # platform(s) this Publisher is configured for. Optional so existing
+        # credential-free/test construction (Publisher(), Publisher(youtube_...))
+        # keeps working -- only next_unpublished_date()/mark_published() require it.
+        self.language_code = language_code
 
         if youtube_client_secret_filepath:
             self._packs["youtube"] = YouTubePublisherPack(
@@ -101,6 +119,7 @@ class Publisher:
             instagram_username=instagram_username,
             instagram_password=instagram_password,
             instagram_session_file=instagram_session_file,
+            language_code=language_code,
         )
 
     @property
@@ -138,3 +157,62 @@ class Publisher:
 
     def publish_to_instagram(self, video_filepath: str, caption: str = "", **kwargs) -> Optional[dict]:
         return self.publish_video("instagram", video_filepath, caption=caption, **kwargs)
+
+    def _require_language_code(self) -> str:
+        if not self.language_code:
+            raise ValueError(
+                "Publisher was constructed without language_code -- publish-date tracking "
+                "(next_unpublished_date/mark_published) needs one. Publisher.for_language() "
+                "always supplies it; pass language_code explicitly to __init__ for other "
+                "construction paths that need tracking."
+            )
+        return self.language_code
+
+    def next_unpublished_date(self, offset_days: int = 1, force: bool = False) -> datetime:
+        """Next content date not yet marked done for this Publisher's
+        language_code, skipping past dates already marked published by
+        mark_published(). Mirrors what a daily-content pipeline needs before
+        starting any work: pick a date, know whether it's safe to proceed.
+
+        Picks a base date from the last published date (falling back to
+        today when nothing's been published yet, or when the last published
+        date implies a publish date that's already in the past): the intended
+        next date is last_published_date + offset_days; if that's already
+        behind today, base off today instead so a gap (e.g. the pipeline
+        didn't run for a while) doesn't pile up a backlog of dates to
+        process one by one.
+
+        force=True skips the already-published check entirely (still using
+        the same base-date logic above), returning the first candidate date
+        outright -- for debug/manual runs that want to reprocess a date
+        regardless of tracked state."""
+        tracker = PublishingTracker(language_code=self._require_language_code())
+        last_published_date = tracker.get_last_published_date()
+
+        base_date = None
+        if last_published_date:
+            current_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            intended_publish_date = last_published_date + timedelta(days=offset_days)
+            if intended_publish_date < current_date:
+                base_date = current_date - timedelta(days=offset_days)
+            else:
+                base_date = last_published_date
+
+        candidate_offset = offset_days
+        while True:
+            candidate_date = get_offset_date(candidate_offset, base_date)
+            if tracker.has_date_been_published(candidate_date) and not force:
+                candidate_offset += 1
+            else:
+                return candidate_date
+
+    def mark_published(self, date_obj: datetime) -> None:
+        """Records date_obj as done for this Publisher's language_code,
+        regardless of whether publishing itself succeeded -- "done" means
+        the caller decided not to retry this date (e.g. to avoid an infinite
+        retry loop on a broken day), not "successfully live". Publisher has
+        no visibility into whether the surrounding pipeline (content fetch,
+        video build, the actual publish_video() calls) succeeded; the caller
+        decides that and calls this only when it wants the date treated as
+        settled."""
+        PublishingTracker(language_code=self._require_language_code()).mark_date_as_published(date_obj)

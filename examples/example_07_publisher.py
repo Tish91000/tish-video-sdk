@@ -7,12 +7,21 @@ Demonstrates:
   safe to call for real, gated on YOUTUBE_CLIENT_SECRET_FILEPATH being set.
   First call opens a browser for one-time OAuth consent, then caches a
   token next to the credential file.
+- next_unpublished_date()/mark_published(): entirely local, no network call
+  -- publish-date tracking for a daily-content pipeline (see ADR 0012). A
+  consuming app calls next_unpublished_date() before starting any work for a
+  cycle, to know which date to process and whether it's already done; and
+  mark_published() once it decides that date is settled (whether or not the
+  underlying platform publish actually succeeded -- that's the caller's call,
+  not Publisher's).
 - publish_video()/publish_to_youtube()/publish_to_instagram(): NOT called
   here. Publishing uploads a real, publicly-visible video to a real
   channel/account -- unlike a search call, it can't be un-done by re-running
   the example, so this stays commented-out sample code rather than something
   that runs by default. Uncomment deliberately, with real arguments, when
-  you actually want to publish something.
+  you actually want to publish something. The commented sample also shows
+  content_date/hour_of_day/utc_offset_hours as an alternative to spelling out
+  publish_year/month/day/hour by hand.
 """
 import os
 
@@ -29,8 +38,14 @@ def main():
         instagram_username=os.getenv("INSTAGRAM_USERNAME", ""),
         instagram_password=os.getenv("INSTAGRAM_PASSWORD", ""),
         instagram_session_file=os.getenv("INSTAGRAM_SESSION_FILE", ""),
+        language_code="en",
     )
     print(f"Configured platforms: {publisher.available()}")
+
+    print("--- Publish-date tracking (local, no network call) ---")
+    next_date = publisher.next_unpublished_date(offset_days=1)
+    print(f"Next unpublished date: {next_date.date()}")
+    print("  (not marking it published here -- keeps re-running this example idempotent)")
 
     print("--- YouTube trending videos (read-only, real API call) ---")
     if publisher.youtube:
@@ -55,9 +70,14 @@ def main():
     #     publisher.publish_to_youtube(
     #         "video.mp4", title="My Video", description="Description", tags=["tag1", "tag2"],
     #         privacy_status="private",  # keep private for a first real test
+    #         # Schedule from a content date instead of spelling out
+    #         # publish_year/month/day/hour by hand:
+    #         content_date=next_date, hour_of_day=21, utc_offset_hours=-2,
     #     )
     # if publisher.instagram:
     #     publisher.publish_to_instagram("video.mp4", caption="My caption")
+    # if overall_pipeline_succeeded:  # the caller's own success/failure decision
+    #     publisher.mark_published(next_date)
 
 
 if __name__ == "__main__":

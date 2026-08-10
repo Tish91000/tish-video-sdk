@@ -29,6 +29,8 @@ from typing import Dict, List, Optional, Type
 
 import httplib2
 
+from ...date_managment import compute_publish_datetime
+
 
 class PublisherPack(ABC):
     """Abstract base for a single publishing platform's adapter."""
@@ -217,12 +219,19 @@ class YouTubePublisherPack(PublisherPack):
                        tags: Optional[List[str]] = None, publish_year: Optional[int] = None,
                        publish_month: Optional[int] = None, publish_day: Optional[int] = None,
                        publish_hour: Optional[int] = None, publish_minute: int = 0,
+                       content_date: Optional[datetime.datetime] = None, hour_of_day: Optional[int] = None,
+                       utc_offset_hours: int = 0,
                        privacy_status: str = "public", notify_subscribers: bool = True,
                        made_for_kids: bool = False, category_id: Optional[int] = None,
                        language_code: Optional[str] = None, **kwargs) -> Optional[dict]:
         """Resumable upload via the YouTube Data API. Scheduling (publish_at)
-        only applies if publish_year/month/day/hour are all given; otherwise
-        the video publishes per privacy_status immediately."""
+        applies if publish_year/month/day/hour are all given, or -- as a
+        higher-level alternative -- if content_date and hour_of_day are both
+        given (publish_minute doubles as the minute in that path too, and
+        utc_offset_hours is added to hour_of_day); computed via
+        date_managment.compute_publish_datetime. publish_year/month/day/hour
+        takes precedence if both forms are given. Otherwise the video
+        publishes per privacy_status immediately."""
         from googleapiclient.http import MediaFileUpload
 
         if not os.path.exists(video_filepath):
@@ -235,6 +244,11 @@ class YouTubePublisherPack(PublisherPack):
         if None not in (publish_year, publish_month, publish_day, publish_hour):
             publish_at_iso = self._create_publish_datetime(publish_year, publish_month, publish_day,
                                                              publish_hour, publish_minute)
+        elif content_date is not None and hour_of_day is not None:
+            scheduled_dt = compute_publish_datetime(content_date, hour_of_day, utc_offset_hours, publish_minute)
+            publish_at_iso = self._create_publish_datetime(
+                scheduled_dt.year, scheduled_dt.month, scheduled_dt.day, scheduled_dt.hour, scheduled_dt.minute
+            )
 
         request_body = self._build_request_body(
             title, description, tags or [], publish_at_iso, privacy_status,

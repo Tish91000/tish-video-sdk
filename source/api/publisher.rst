@@ -43,6 +43,24 @@ login (``instagram_username``/``instagram_password``), optionally caching
 the resulting session to ``instagram_session_file`` so later runs can skip
 the login challenge.
 
+:class:`Publisher` also owns publish-date tracking --
+:meth:`Publisher.next_unpublished_date`/:meth:`Publisher.mark_published`, per
+``language_code`` rather than per platform, so a consuming app's daily-content
+pipeline asks the same object it publishes through whether today's content
+was already handled, instead of reaching into
+:class:`~tish_video_sdk.date_managment.PublishingTracker` directly (see
+:doc:`date_managment` and ADR 0012). ``language_code`` is an optional
+``__init__`` param, independent of ``youtube_language_code`` (which only
+feeds YouTube's ``defaultLanguage`` snippet field) -- required only when
+``next_unpublished_date``/``mark_published`` are actually called, so existing
+credential-free construction keeps working. :meth:`YouTubePublisherPack
+<tish_video_sdk.internal.providers.publisher_packs.YouTubePublisherPack.publish_video>`'s
+``publish_video`` also accepts ``content_date``/``hour_of_day``/
+``utc_offset_hours`` as a higher-level alternative to spelling out
+``publish_year``/``publish_month``/``publish_day``/``publish_hour`` by hand --
+computed internally via
+:func:`~tish_video_sdk.date_managment.compute_publish_datetime`.
+
 .. automodule:: tish_video_sdk.publisher
    :members:
    :undoc-members:
@@ -58,12 +76,20 @@ Usage
    publisher = Publisher(
        youtube_client_secret_filepath="client_secret.json",
        instagram_username="...", instagram_password="...",
+       language_code="en",
    )
+
+   # Publish-date tracking: pick the next date to process, skipping dates
+   # already marked done for this language.
+   content_date = publisher.next_unpublished_date(offset_days=1)
 
    publisher.publish_to_youtube(
        "video.mp4", title="My Video", description="...", tags=["tag1", "tag2"],
+       content_date=content_date, hour_of_day=21, utc_offset_hours=-2,
    )
    publisher.publish_to_instagram("video.mp4", caption="My caption")
+
+   publisher.mark_published(content_date)  # once the caller decides this date is settled
 
    # Platform-specific operations
    trends = publisher.youtube.get_trending_videos(region_code="US")

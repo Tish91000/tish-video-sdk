@@ -23,6 +23,7 @@ classifiers = [
 ]
 dependencies = [
     "beautifulsoup4",
+    "duckduckgo_search",
     "google-cloud-texttospeech",
     "google-genai",
     "langchain",
@@ -34,6 +35,8 @@ dependencies = [
     "Pillow>=8.0.0",
     "pydub",
     "python-dotenv",
+    "requests",
+    "wikipedia",
 ]
 
 [project.optional-dependencies]

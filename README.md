@@ -9,6 +9,7 @@ A Python SDK for generating videos with narration, subtitles, music, and imagery
 - **Timed text overlays** (titles, captions, karaoke-style word-highlighted text) composited onto the video
 - **Subtitle generation** from narration audio via forced alignment (Montreal Forced Aligner) or time-based splitting, styled per language via SubtitlePack config
 - **Background music** selection and mixing, by mood name, Gemini-driven text analysis, or a direct file path
+- **Image search and generation**: multi-source web image/video search (Pexels, DuckDuckGo, Wikipedia) with local caching, AI image generation via Imagen (search-first with generation as fallback), and general-purpose aspect-ratio/compositing utilities
 
 ## Installation
 
@@ -38,6 +39,13 @@ from tish_video_sdk.music import MusicManager
 
 manager = MusicManager(bgm_directory="./music/bgm")
 manager.add_background_music("narration.wav", "narration_with_music.wav", music_input="calm")
+```
+
+```python
+from tish_video_sdk.media import ImageGenerator
+
+generator = ImageGenerator(output_directory="./images")
+paths = generator.search_or_generate("a quiet mountain sunrise", output_name="sunrise_scene")
 ```
 
 See the full API reference under `source/api/`.

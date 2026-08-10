@@ -59,3 +59,14 @@ The ``music`` module (background-music selection and mixing, via ``MusicManager`
   instead of falling back to ``default_music_file`` -- the downloaded file behaves like
   any other local track from then on. Can also be passed directly as
   ``MusicManager(jamendo_client_id=...)``.
+
+The ``media`` module (``ImageFetcher``, ``ImageSearcher``, ``ImageGenerator``) reads:
+
+* ``PEXELS_API_KEY`` — optional, free (register at `pexels.com/api
+  <https://www.pexels.com/api/>`_). Used for the ``'pexels'`` image/video source; unset,
+  that source is simply skipped (DuckDuckGo and Wikipedia need no credentials). Can also
+  be passed directly as ``ImageFetcher(pexels_api_key=...)``/``ImageSearcher(pexels_api_key=...)``.
+* ``GEMINI_API_KEY`` (or ``GOOGLE_API_KEY``) — Google GenAI API key, used for Imagen
+  image generation and for condensing a search query in ``search_or_generate()``.
+  ``generate_image()``/``search_or_generate()`` return ``[]`` without one rather than
+  raising. Can also be passed directly as ``ImageGenerator(api_key=...)``.

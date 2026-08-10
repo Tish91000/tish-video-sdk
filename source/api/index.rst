@@ -8,3 +8,4 @@ API Reference
    video_maker
    subtitles
    music
+   media

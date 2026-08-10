@@ -70,3 +70,17 @@ The ``media`` module (``ImageFetcher``, ``ImageSearcher``, ``ImageGenerator``) r
   image generation and for condensing a search query in ``search_or_generate()``.
   ``generate_image()``/``search_or_generate()`` return ``[]`` without one rather than
   raising. Can also be passed directly as ``ImageGenerator(api_key=...)``.
+
+The ``publisher`` module (``Publisher``) reads:
+
+* ``YOUTUBE_CLIENT_SECRET_FILEPATH`` — path to an OAuth "installed app" (Desktop) credential
+  JSON from the Google Cloud Console, for the account that owns the target YouTube channel.
+  Without it, ``publisher.youtube`` is ``None`` and YouTube publishing is unavailable. The
+  first call opens a browser for one-time consent; the resulting token is cached next to the
+  credential file (``youtube_token_filename``, default ``token.pickle``) and refreshed
+  automatically afterward. Can also be passed directly as
+  ``Publisher(youtube_client_secret_filepath=...)``.
+* ``INSTAGRAM_USERNAME`` / ``INSTAGRAM_PASSWORD`` — Instagram login credentials. Without
+  both, ``publisher.instagram`` is ``None``. ``INSTAGRAM_SESSION_FILE`` (optional) caches the
+  login session so later runs can skip the login challenge when possible. Can also be passed
+  directly as ``Publisher(instagram_username=..., instagram_password=..., instagram_session_file=...)``.

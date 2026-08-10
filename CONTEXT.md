@@ -11,3 +11,7 @@ _Avoid_: adding channel-specific features to the SDK "because it's convenient" f
 **VoicePack**:
 A single TTS provider's (Gemini, Google Cloud, Amazon Polly, Deepgram, Gradium, ...) adapter for one language — pairs that provider's config (voice name, credentials, character limits, SSML support) with its own model-loading and synthesis logic. A process loads every VoicePack it might need (any number of languages and providers); `TTSBuilder(language_code, provider=None)` filters to the ordered chain for one call, falling back to the next VoicePack on a provider-level failure unless `provider` pins it to exactly one.
 _Avoid_: provider, TTS backend, TTS engine
+
+**publisher_packs.json**:
+Per-language, per-provider YouTube/Instagram publishing credentials (client_secret_filepath/token_filename for YouTube, username/password/session_file for Instagram), loaded from `PUBLISHER_PACKS_PATH`. `Publisher.for_language(language_code)` is the credential-free entry point that reads this file directly; `Publisher.__init__` still takes raw credentials for explicit/advanced construction (e.g. tests) that don't want a config file.
+_Avoid_: passing `youtube_client_secret_filepath`/`youtube_token_filename` from application code when `for_language()` would do

@@ -24,8 +24,12 @@ classifiers = [
 dependencies = [
     "beautifulsoup4",
     "duckduckgo_search",
+    "google-api-python-client",
+    "google-auth",
+    "google-auth-oauthlib",
     "google-cloud-texttospeech",
     "google-genai",
+    "instagrapi",
     "langchain",
     "langchain-core",
     "langchain-google-genai",

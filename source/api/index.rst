@@ -9,3 +9,4 @@ API Reference
    subtitles
    music
    media
+   publisher

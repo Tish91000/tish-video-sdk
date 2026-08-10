@@ -10,6 +10,7 @@ A Python SDK for generating videos with narration, subtitles, music, and imagery
 - **Subtitle generation** from narration audio via forced alignment (Montreal Forced Aligner) or time-based splitting, styled per language via SubtitlePack config
 - **Background music** selection and mixing, by mood name, Gemini-driven text analysis, or a direct file path
 - **Image search and generation**: multi-source web image/video search (Pexels, DuckDuckGo, Wikipedia) with local caching, AI image generation via Imagen (search-first with generation as fallback), and general-purpose aspect-ratio/compositing utilities
+- **Publishing**: video uploads to YouTube (OAuth, resumable upload, comments, thumbnails, trending/search) and Instagram Reels
 
 ## Installation
 
@@ -46,6 +47,13 @@ from tish_video_sdk.media import ImageGenerator
 
 generator = ImageGenerator(output_directory="./images")
 paths = generator.search_or_generate("a quiet mountain sunrise", output_name="sunrise_scene")
+```
+
+```python
+from tish_video_sdk.publisher import Publisher
+
+publisher = Publisher(youtube_client_secret_filepath="client_secret.json")
+publisher.publish_to_youtube("output.mp4", title="My Video", description="...", tags=["tag1"])
 ```
 
 See the full API reference under `source/api/`.

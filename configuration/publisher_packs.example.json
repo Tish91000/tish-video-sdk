@@ -1,0 +1,23 @@
+[
+  {
+    "provider": "youtube",
+    "language_code": "fr",
+    "client_secret_filepath": "./api_keys/client_secret.json",
+    "token_filename": "token_fr.json",
+    "category_id": 22
+  },
+  {
+    "provider": "instagram",
+    "language_code": "fr",
+    "username": "<your Instagram username>",
+    "password": "<your Instagram password>",
+    "session_file": "./api_keys/instagram_session_fr.json"
+  },
+  {
+    "provider": "youtube",
+    "language_code": "en",
+    "client_secret_filepath": "./api_keys/client_secret.json",
+    "token_filename": "token_en.json",
+    "category_id": 22
+  }
+]

@@ -60,6 +60,10 @@ MFA_ERROR_MESSAGE = (
 # Configuration constants
 USE_MFA_ALIGNMENT = True  # Set to True to use MFA forced alignment, False for time-based splitting
 
+# MFA tokens that aren't real words (skipped words, epsilon transitions) --
+# shared between fragment-matching and the raw aligned-words list.
+_NOISE_TOKENS = {"", "[bracketed]", "<unk>", "<eps>"}
+
 
 class SubtitleBuilder:
     """Builder for generating subtitles from audio, optionally aligning with reference text."""
@@ -70,6 +74,10 @@ class SubtitleBuilder:
         self._reference_text: Optional[str] = None
         self._transcribed_segments: List[Dict] = []
         self._is_built = False
+        self._beam: Optional[int] = None
+        self._retry_beam: Optional[int] = None
+        self._aligned_words: List[Dict] = []
+        self._segments: Optional[List[Dict]] = None
 
     @classmethod
     def from_audio(cls, audio_filepath: str, language_code: str) -> 'SubtitleBuilder':
@@ -78,10 +86,54 @@ class SubtitleBuilder:
         return builder
 
     @classmethod
-    def from_audio_with_reference(cls, audio_filepath: str, reference_text: str, language_code: str) -> 'SubtitleBuilder':
+    def from_audio_with_reference(
+        cls,
+        audio_filepath: str,
+        reference_text: str,
+        language_code: str,
+        beam: Optional[int] = None,
+        retry_beam: Optional[int] = None,
+    ) -> 'SubtitleBuilder':
+        """
+        Args:
+            beam, retry_beam: Passed through to `mfa align --beam --retry_beam`.
+                Omit to use MFA's own defaults, which can fail to align long
+                audio treated as one utterance; widening the beam fixes it
+                at the cost of slower alignment.
+        """
         builder = cls(language_code)
         builder._audio_filepath = audio_filepath
         builder._reference_text = reference_text
+        builder._beam = beam
+        builder._retry_beam = retry_beam
+        return builder
+
+    @classmethod
+    def from_audio_segments_with_reference(
+        cls,
+        audio_filepath: str,
+        segments: List[Dict],
+        language_code: str,
+        beam: Optional[int] = None,
+        retry_beam: Optional[int] = None,
+    ) -> 'SubtitleBuilder':
+        """
+        Align many known-boundary segments of one audio file (e.g. one per
+        song line) in a single MFA pass, constraining each segment's search
+        to its own window instead of the whole recording -- improves both
+        word-level accuracy and placement within long audio.
+
+        Args:
+            audio_filepath: One audio file covering all segments.
+            segments (List[Dict]): `{"start", "end", "text"}` dicts (seconds),
+                in the audio's own timeline, non-overlapping.
+            beam, retry_beam: See from_audio_with_reference.
+        """
+        builder = cls(language_code)
+        builder._audio_filepath = audio_filepath
+        builder._segments = segments
+        builder._beam = beam
+        builder._retry_beam = retry_beam
         return builder
 
     def build(self) -> Optional['SubtitleBuilder']:
@@ -120,10 +172,15 @@ class SubtitleBuilder:
                 return None
 
         # MFA forced alignment
-        if not self._reference_text:
-            raise ValueError("MFA forced alignment requires reference text. None was provided.")
+        if self._segments is not None:
+            if not self._segments:
+                raise ValueError("MFA forced alignment requires at least one segment. None were provided.")
+            mfa_segments = self._align_audio_with_mfa_segments()
+        else:
+            if not self._reference_text:
+                raise ValueError("MFA forced alignment requires reference text. None was provided.")
+            mfa_segments = self._align_audio_with_mfa()
 
-        mfa_segments = self._align_audio_with_mfa()
         if mfa_segments is None:
             print("Error: MFA alignment failed.")
             return None
@@ -138,6 +195,16 @@ class SubtitleBuilder:
             print("Warning: SubtitleBuilder not built yet. Call build() first.")
             return []
         return self._transcribed_segments
+
+    def get_words(self) -> List[Dict]:
+        """The flat, time-ordered `{"word", "start", "end"}` list MFA itself
+        produced, unlike get_segments()'s lossy sentence-punctuation
+        grouping. Use this when doing your own segmentation over already
+        aligned words. Empty until build() has run a real MFA alignment."""
+        if not self._is_built:
+            print("Warning: SubtitleBuilder not built yet. Call build() first.")
+            return []
+        return self._aligned_words
 
     def save_segments_to_json(self, output_filepath: str) -> Optional[str]:
         if not self._is_built:
@@ -194,8 +261,6 @@ class SubtitleBuilder:
         hyphenated compounds, tagging unrecognized words as '[bracketed]'), so
         this resyncs on local mismatches rather than assuming a strict 1:1
         count between fragment words and MFA words."""
-        NOISE_TOKENS = {"", "[bracketed]", "<unk>", "<eps>"}
-
         frag_tokens: List[Tuple[int, str]] = []
         for frag_idx, frag in enumerate(fragments):
             for w in frag.split():
@@ -204,7 +269,7 @@ class SubtitleBuilder:
                     frag_tokens.append((frag_idx, n))
 
         mfa_norm = [
-            "NOISE" if raw in NOISE_TOKENS else cls._normalize_word_for_matching(raw)
+            "NOISE" if raw in _NOISE_TOKENS else cls._normalize_word_for_matching(raw)
             for _, _, raw in mfa_words
         ]
 
@@ -240,10 +305,176 @@ class SubtitleBuilder:
                 "end": frag_matches[-1][1],
                 "words": [
                     {"word": w, "start": s, "end": e}
-                    for s, e, w in frag_matches if w not in NOISE_TOKENS
+                    for s, e, w in frag_matches if w not in _NOISE_TOKENS
                 ],
             })
         return segments
+
+    @staticmethod
+    def _clean_plain_text(text: str) -> str:
+        """Strip [SFX:...] tags and SSML markup down to plain text and
+        collapse whitespace -- shared by the whole-file and segmented MFA
+        alignment paths."""
+        cleaned_source = re.sub(r'\[SFX:.*?\]', '', text, flags=re.IGNORECASE)
+
+        is_ssml = "<speak>" in cleaned_source
+        if is_ssml:
+            try:
+                soup = BeautifulSoup(cleaned_source, "xml")
+                plain_text = soup.get_text(separator=" ", strip=True)
+            except Exception as e:
+                print(f"Error parsing SSML: {e}. Falling back to plain regex text cleaning.")
+                plain_text = re.sub(r'<[^>]+>', '', cleaned_source)
+        else:
+            plain_text = cleaned_source
+
+        return re.sub(r'\s+', ' ', plain_text).strip()
+
+    @staticmethod
+    def _build_utterances_textgrid(duration: float, segments: List[Tuple[float, float, str]]) -> str:
+        """A minimal Praat TextGrid with one IntervalTier ("utterances"),
+        one interval per segment. Intervals must be contiguous and span
+        [0, duration], so gaps between segments get empty-text intervals."""
+        intervals: List[Tuple[float, float, str]] = []
+        cursor = 0.0
+        for start, end, text in segments:
+            if start > cursor:
+                intervals.append((cursor, start, ""))
+            intervals.append((start, end, text))
+            cursor = end
+        if cursor < duration:
+            intervals.append((cursor, duration, ""))
+
+        lines = [
+            'File type = "ooTextFile"',
+            'Object class = "TextGrid"',
+            "",
+            "xmin = 0",
+            f"xmax = {duration}",
+            "tiers? <exists>",
+            "size = 1",
+            "item []:",
+            "    item [1]:",
+            '        class = "IntervalTier"',
+            '        name = "utterances"',
+            "        xmin = 0",
+            f"        xmax = {duration}",
+            f"        intervals: size = {len(intervals)}",
+        ]
+        for idx, (xmin, xmax, text) in enumerate(intervals, start=1):
+            escaped_text = text.replace('"', '""')
+            lines += [
+                f"        intervals [{idx}]:",
+                f"            xmin = {xmin}",
+                f"            xmax = {xmax}",
+                f'            text = "{escaped_text}"',
+            ]
+        return "\n".join(lines) + "\n"
+
+    def _align_audio_with_mfa_segments(self) -> Optional[List[Dict]]:
+        """Align audio against many known-boundary segments of reference
+        text via an MFA TextGrid corpus (one utterance per segment, all
+        against the same whole-file WAV) -- see
+        from_audio_segments_with_reference()."""
+        print(f"DEBUG: Starting segmented MFA forced alignment on audio file: {self._audio_filepath}")
+        if not self._audio_filepath or not os.path.exists(self._audio_filepath):
+            print(f"Error: Audio file '{self._audio_filepath}' does not exist.")
+            return None
+
+        mfa_env_path = os.getenv("MFA_ENV_PATH")
+        if not mfa_env_path or not os.path.isdir(mfa_env_path):
+            print(MFA_ERROR_MESSAGE)
+            return None
+
+        model_name = get_subtitle_pack(self.language_code).mfa_model
+
+        duration = self._get_audio_duration()
+        if duration <= 0:
+            print("Error: Could not determine audio duration for segmented alignment.")
+            return None
+
+        cleaned_segments: List[Tuple[float, float, str]] = []
+        for seg in sorted(self._segments, key=lambda s: s["start"]):
+            text = self._clean_plain_text(seg["text"])
+            start = max(0.0, min(float(seg["start"]), duration))
+            end = max(start, min(float(seg["end"]), duration))
+            if text and end > start:
+                cleaned_segments.append((start, end, text))
+
+        if not cleaned_segments:
+            print("Error: No usable segments found for alignment.")
+            return None
+
+        mfa_exe, env = self._mfa_executable_and_env(mfa_env_path)
+        if not os.path.exists(mfa_exe):
+            print(MFA_ERROR_MESSAGE)
+            return None
+
+        with tempfile.TemporaryDirectory(prefix="mfa_corpus_") as corpus_dir:
+            speaker_dir = os.path.join(corpus_dir, "speaker1")
+            os.makedirs(speaker_dir, exist_ok=True)
+            utterance_name = "utterance"
+            shutil.copy(self._audio_filepath, os.path.join(speaker_dir, f"{utterance_name}.wav"))
+            textgrid = self._build_utterances_textgrid(duration, cleaned_segments)
+            with open(os.path.join(speaker_dir, f"{utterance_name}.TextGrid"), "w", encoding="utf-8") as f:
+                f.write(textgrid)
+
+            output_dir = os.path.join(corpus_dir, "output")
+            align_cmd = [
+                mfa_exe, "align", corpus_dir, model_name, model_name, output_dir,
+                "--clean", "--output_format", "json",
+            ]
+            if self._beam is not None:
+                align_cmd += ["--beam", str(self._beam)]
+            if self._retry_beam is not None:
+                align_cmd += ["--retry_beam", str(self._retry_beam)]
+
+            print("Running segmented MFA forced alignment...")
+            result = subprocess.run(align_cmd, env=env, capture_output=True, text=True)
+            if result.returncode != 0:
+                print(f"Error during MFA forced alignment:\n{result.stderr[-3000:]}")
+                return None
+            print("MFA forced alignment completed.")
+
+            json_path = os.path.join(output_dir, "speaker1", f"{utterance_name}.json")
+            if not os.path.exists(json_path):
+                print(f"Error: MFA did not produce expected output at '{json_path}'.")
+                return None
+
+            with open(json_path, "r", encoding="utf-8") as f:
+                mfa_data = json.load(f)
+
+            mfa_words = [
+                (float(entry[0]), float(entry[1]), entry[2])
+                for entry in mfa_data.get("tiers", {}).get("words", {}).get("entries", [])
+                if entry[2].strip()
+            ]
+
+        if not mfa_words:
+            print("Error: MFA produced no word-level alignments.")
+            return None
+
+        # Bucket raw (pre-noise-filter) entries by midpoint into their segment.
+        segments_out = []
+        for start, end, text in cleaned_segments:
+            raw_entries = [w for w in mfa_words if start <= (w[0] + w[1]) / 2 <= end]
+            expected_words = text.split()
+            if len(raw_entries) == len(expected_words):
+                # Word count matches, so trust our own text over MFA's label
+                # (which can be an uncertain tag like <unk>) and keep its timing.
+                seg_words = [
+                    {"word": expected_words[i], "start": raw_entries[i][0], "end": raw_entries[i][1]}
+                    for i in range(len(expected_words))
+                ]
+            else:
+                seg_words = [
+                    {"word": w, "start": s, "end": e}
+                    for s, e, w in raw_entries if w not in _NOISE_TOKENS
+                ]
+            segments_out.append({"text": text, "start": start, "end": end, "words": seg_words})
+
+        self._aligned_words = [w for seg in segments_out for w in seg["words"]]
+        return segments_out
 
     def _align_audio_with_mfa(self) -> Optional[List[Dict]]:
         """Align audio with reference text using Montreal Forced Aligner (MFA)."""
@@ -261,21 +492,7 @@ class SubtitleBuilder:
         # this language before ever calling this method.
         model_name = get_subtitle_pack(self.language_code).mfa_model
 
-        # Clean reference text (strip [SFX] and SSML tags)
-        cleaned_source = re.sub(r'\[SFX:.*?\]', '', self._reference_text, flags=re.IGNORECASE)
-
-        is_ssml = "<speak>" in cleaned_source
-        if is_ssml:
-            try:
-                soup = BeautifulSoup(cleaned_source, "xml")
-                plain_text = soup.get_text(separator=" ", strip=True)
-            except Exception as e:
-                print(f"Error parsing SSML: {e}. Falling back to plain regex text cleaning.")
-                plain_text = re.sub(r'<[^>]+>', '', cleaned_source)
-        else:
-            plain_text = cleaned_source
-
-        plain_text = re.sub(r'\s+', ' ', plain_text).strip()
+        plain_text = self._clean_plain_text(self._reference_text)
 
         # Split into sentence-level fragments (by sentence-ending punctuation)
         sentences = re.split(r'(?<=[.?!])\s+', plain_text)
@@ -299,12 +516,18 @@ class SubtitleBuilder:
                 f.write(plain_text)
 
             output_dir = os.path.join(corpus_dir, "output")
+            align_cmd = [
+                mfa_exe, "align", corpus_dir, model_name, model_name, output_dir,
+                "--clean", "--output_format", "json",
+            ]
+            if self._beam is not None:
+                align_cmd += ["--beam", str(self._beam)]
+            if self._retry_beam is not None:
+                align_cmd += ["--retry_beam", str(self._retry_beam)]
+
             print("Running MFA forced alignment...")
             result = subprocess.run(
-                [
-                    mfa_exe, "align", corpus_dir, model_name, model_name, output_dir,
-                    "--clean", "--output_format", "json",
-                ],
+                align_cmd,
                 env=env,
                 capture_output=True,
                 text=True,
@@ -332,6 +555,10 @@ class SubtitleBuilder:
             print("Error: MFA produced no word-level alignments.")
             return None
 
+        self._aligned_words = [
+            {"word": w, "start": s, "end": e}
+            for s, e, w in mfa_words if w not in _NOISE_TOKENS
+        ]
         return self._map_mfa_words_to_fragments(fragments, mfa_words)
 
     def _get_audio_duration(self) -> float:

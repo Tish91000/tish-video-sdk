@@ -74,6 +74,23 @@ class TextStyle:
     highlight_color: str = '#FFD700'
     timing_offset: float = 0.0
     language_code: str = 'en'
+    # 'instant': only the current word is highlighted, one at a time.
+    # 'karaoke': already-read words stay highlighted, and the active word
+    # fills in progressively rather than popping instantly.
+    highlight_style: str = 'instant'
+    # >0 shows the current line plus this many lines before/after it,
+    # scrolling as it advances; only the current line gets word highlighting.
+    context_lines: int = 0
+    # Opacity of non-current lines in the scrolling display.
+    context_opacity: float = 0.5
+    # Font size of non-current lines, relative to the current line's.
+    context_font_scale: float = 0.75
+    # Seconds before its own start that an upcoming line may appear, so a
+    # long instrumental gap doesn't reveal it too early.
+    upcoming_lead: float = 3.0
+    # Seconds the scrolling display takes to glide to the next current line
+    # (position/size/opacity ease smoothly); 0 snaps instantly.
+    scroll_duration: float = 0.35
 
     def get_font_for_language(self) -> str:
         """Return this style's font family, as resolved from configuration
@@ -104,6 +121,18 @@ class TextStyle:
                 ImageColor.getrgb(self.highlight_color)
             except ValueError:
                 raise ValueError(f"Invalid highlight_color: {self.highlight_color}")
+        if self.highlight_style not in ('instant', 'karaoke'):
+            raise ValueError(f"highlight_style must be 'instant' or 'karaoke', got: {self.highlight_style!r}")
+        if self.context_lines < 0:
+            raise ValueError("context_lines must be non-negative")
+        if not 0.0 <= self.context_opacity <= 1.0:
+            raise ValueError("context_opacity must be between 0.0 and 1.0")
+        if self.context_font_scale <= 0:
+            raise ValueError("context_font_scale must be positive")
+        if self.upcoming_lead < 0:
+            raise ValueError("upcoming_lead must be non-negative")
+        if self.scroll_duration < 0:
+            raise ValueError("scroll_duration must be non-negative")
 
 
 class VideoBuilder:
@@ -1126,11 +1155,21 @@ class VideoBuilder:
         # Default fallback
         return os.path.join(fonts_dir, 'arial.ttf')
 
-    def _render_text_frame_pil(self, width: int, height: int, words: List[Dict], active_word_idx: Optional[int], style: TextStyle, has_word_timestamps: bool = True) -> Image.Image:
+    def _render_text_frame_pil(self, width: int, height: int, words: List[Dict], active_word_idx: Optional[int], style: TextStyle, has_word_timestamps: bool = True, current_time: Optional[float] = None) -> Tuple[Image.Image, Tuple[int, int]]:
         """
         Renders a single frame of text using PIL.
         Supports word-level highlighting, wrapping, outline/stroke, and rounded-corner background box.
         Dynamically adapts font size to fit the available space.
+
+        Returns (image, (x, y)): image is cropped to the actual drawn content's
+        bounding box, not the full width x height canvas, and (x, y) is where
+        that crop belongs in the full frame. Word-highlight animation calls
+        this once per short sub-interval -- potentially thousands of times for
+        a whole song under 'karaoke' highlight_style's finer subdivision --
+        and each call's caller keeps the result alive until the final
+        composite, so a full-canvas RGBA array (+ a separate float mask) per
+        call can exhaust memory well before that composite happens. Cropping
+        to content keeps each one to a small fraction of the canvas.
         """
         if not has_word_timestamps:
             active_word_idx = None
@@ -1219,7 +1258,7 @@ class VideoBuilder:
         resolved_font_size = current_font_size
 
         if not lines:
-            return img
+            return img, (0, 0)
 
         # 6. Determine text position on the screen
         pos_x, pos_y = style.text_position
@@ -1314,28 +1353,87 @@ class VideoBuilder:
         font_color = style.font_color or 'white'
         stroke_color = style.stroke_color or 'black'
         stroke_width = style.stroke_width or 0
+        karaoke = has_word_timestamps and style.highlight_style == 'karaoke' and current_time is not None
 
         for line, line_w, line_x, line_y in line_info:
             curr_x = line_x
             for w_dict, is_active, idx, w_width in line:
                 word_text = w_dict.get('word', '')
 
-                # Active word highlight color, else normal font color
-                color = highlight_color if is_active else font_color
+                if karaoke:
+                    # Cumulative + progressive: words already finished stay
+                    # highlight_color, the word currently being sung fills
+                    # from font_color to highlight_color over its own span,
+                    # words not yet reached stay font_color.
+                    w_start = w_dict.get('start', 0.0)
+                    w_end = w_dict.get('end', 0.0)
+                    if current_time >= w_end:
+                        progress = 1.0
+                    elif current_time <= w_start or w_end <= w_start:
+                        progress = 0.0
+                    else:
+                        progress = (current_time - w_start) / (w_end - w_start)
 
-                # Draw the word
-                draw.text(
-                    (curr_x, line_y),
-                    word_text + " ",
-                    fill=color,
-                    font=font,
-                    stroke_width=stroke_width,
-                    stroke_fill=stroke_color
-                )
+                    draw.text(
+                        (curr_x, line_y), word_text + " ", fill=font_color,
+                        font=font, stroke_width=stroke_width, stroke_fill=stroke_color,
+                    )
+                    fill_w = int(round(w_width * progress))
+                    if fill_w > 0:
+                        # Word-sized overlay, not img.size -- this runs once
+                        # per active-word sub-interval (many per word under
+                        # karaoke's fine subdivision), so a full-canvas
+                        # allocation here multiplies the same memory problem
+                        # documented on this method's docstring.
+                        ov_pad = stroke_width + 4
+                        ov_left = curr_x
+                        ov_top = max(0, line_y - ov_pad)
+                        ov_w = w_width + ov_pad
+                        ov_h = line_height + 2 * ov_pad
+                        overlay = Image.new("RGBA", (ov_w, ov_h), (0, 0, 0, 0))
+                        ImageDraw.Draw(overlay).text(
+                            (0, line_y - ov_top), word_text + " ", fill=highlight_color,
+                            font=font, stroke_width=stroke_width, stroke_fill=stroke_color,
+                        )
+                        region = overlay.crop((0, 0, min(fill_w, ov_w), ov_h))
+                        img.paste(region, (ov_left, ov_top), region)
+                else:
+                    # Active word highlight color, else normal font color
+                    color = highlight_color if is_active else font_color
+                    draw.text(
+                        (curr_x, line_y),
+                        word_text + " ",
+                        fill=color,
+                        font=font,
+                        stroke_width=stroke_width,
+                        stroke_fill=stroke_color
+                    )
 
                 curr_x += w_width
 
-        return img
+        # Crop to the actual drawn content's bounding box -- see this
+        # method's docstring for why (memory: many small arrays instead of
+        # many full-canvas ones).
+        pad = stroke_width + max(4, int(resolved_font_size * 0.3))
+        min_x = min(info[2] for info in line_info)
+        max_x = max(info[2] + info[1] for info in line_info)
+        min_y = y_start
+        max_y = y_start + total_height
+        if style.bg_color:
+            min_x = min(min_x, box_left)
+            max_x = max(max_x, box_right)
+            min_y = min(min_y, box_top)
+            max_y = max(max_y, box_bottom)
+
+        left = max(0, int(min_x) - pad)
+        top = max(0, int(min_y) - pad)
+        right = min(width, int(max_x) + pad)
+        bottom = min(height, int(max_y) + pad)
+
+        if right <= left or bottom <= top:
+            return img, (0, 0)
+
+        return img.crop((left, top, right, bottom)), (left, top)
 
     def _overlay_text_segments_on_single_clip(self, video_clip: VideoFileClip, segments: List[Dict]) -> Optional[VideoFileClip]:
         """Overlay timed text segments on a single video clip using PIL rendering.
@@ -1350,6 +1448,9 @@ class VideoBuilder:
             return video_clip
 
         style = self._text_style or TextStyle()
+
+        if style.context_lines > 0:
+            return self._overlay_scrolling_lyrics_on_single_clip(video_clip, segments, style)
 
         text_clips = []
 
@@ -1396,6 +1497,10 @@ class VideoBuilder:
                 words = sorted(words, key=lambda x: x.get('start', 0.0))
 
                 # Determine time boundaries for sub-intervals within the segment
+                karaoke = has_word_timestamps and style.highlight_style == 'karaoke'
+                max_steps_per_word = 8  # cap so a long held note doesn't blow up clip count
+                fps = self.fps or DEFAULT_FPS
+
                 boundaries = [seg_start]
                 for w in words:
                     w_start = w.get('start', 0.0)
@@ -1404,11 +1509,28 @@ class VideoBuilder:
                     w_start = max(seg_start, min(w_start, seg_end))
                     w_end = max(seg_start, min(w_end, seg_end))
                     boundaries.append(w_start)
+                    if karaoke and w_end > w_start:
+                        step_count = max(1, min(max_steps_per_word, int(round((w_end - w_start) * fps))))
+                        step = (w_end - w_start) / step_count
+                        boundaries.extend(w_start + i * step for i in range(1, step_count))
                     boundaries.append(w_end)
                 boundaries.append(seg_end)
 
                 # Remove duplicates and sort
                 boundaries = sorted(list(set(boundaries)))
+
+                # Merge boundaries closer than a frame apart -- otherwise the
+                # tiny interval between them gets skipped below, and if that
+                # gap lands on an encoded frame it renders blank.
+                if len(boundaries) > 1:
+                    min_gap = 1.0 / fps
+                    merged = [boundaries[0]]
+                    for b in boundaries[1:]:
+                        if b - merged[-1] >= min_gap:
+                            merged.append(b)
+                    if merged[-1] != boundaries[-1]:
+                        merged[-1] = boundaries[-1]
+                    boundaries = merged
 
                 # Generate a clip for each sub-interval
                 for idx in range(len(boundaries) - 1):
@@ -1427,22 +1549,29 @@ class VideoBuilder:
                             active_idx = w_idx
                             break
 
-                    # Render frame using PIL
-                    frame_img = self._render_text_frame_pil(video_clip.w, video_clip.h, words, active_idx, style, has_word_timestamps)
+                    # Render frame using PIL -- cropped to its content's
+                    # bounding box, not the full canvas (see
+                    # _render_text_frame_pil's docstring)
+                    frame_img, (frame_x, frame_y) = self._render_text_frame_pil(
+                        video_clip.w, video_clip.h, words, active_idx, style, has_word_timestamps,
+                        current_time=mid if karaoke else None,
+                    )
 
                     # Convert to RGBA numpy array
                     frame_arr = np.array(frame_img)
 
                     rgb_arr = frame_arr[:, :, :3]
-                    alpha_arr = frame_arr[:, :, 3] / 255.0  # Normalize alpha to 0.0-1.0
+                    alpha_arr = (frame_arr[:, :, 3] / 255.0).astype(np.float32)  # Normalize alpha to 0.0-1.0
 
                     # Create the ImageClip and its transparency mask
                     img_clip = ImageClip(rgb_arr)
                     mask_clip = ImageClip(alpha_arr, is_mask=True)
                     img_clip = img_clip.with_mask(mask_clip)
 
-                    # Set time parameters
-                    img_clip = img_clip.with_start(t1).with_duration(dur)
+                    # Set time and position parameters (position is absolute
+                    # pixels, matching where _render_text_frame_pil cropped
+                    # the content from within the full canvas)
+                    img_clip = img_clip.with_start(t1).with_duration(dur).with_position((frame_x, frame_y))
                     text_clips.append(img_clip)
 
         except Exception as e:
@@ -1474,6 +1603,543 @@ class VideoBuilder:
                 except:
                     pass
             return None
+
+    def _overlay_scrolling_lyrics_on_single_clip(self, video_clip: VideoFileClip, segments: List[Dict], style: TextStyle) -> Optional[VideoFileClip]:
+        """Scrolling multi-line lyric display (style.context_lines > 0):
+        shows the current line plus lines before/after it, stacked around
+        the current line's fixed position so earlier/later lines scroll as
+        it advances. An upcoming line only joins the window
+        style.upcoming_lead seconds before its own start."""
+        offset = getattr(style, 'timing_offset', 0.0)
+        prepared = []
+        for segment in segments:
+            text_content = segment.get('text', '').replace('\n', ' ').strip()
+            seg_start = segment.get('start', 0.0) + offset
+            seg_end = segment.get('end', 0.0) + offset
+            if not text_content or seg_start >= seg_end:
+                continue
+
+            words = segment.get('words', [])
+            if words:
+                words = [
+                    {
+                        'word': w.get('word', ''),
+                        'start': w.get('start', 0.0) + offset,
+                        'end': w.get('end', 0.0) + offset,
+                    }
+                    for w in words
+                ]
+            else:
+                word_list = text_content.split()
+                duration = seg_end - seg_start
+                per_word_duration = duration / len(word_list) if word_list else 0.0
+                words = [
+                    {
+                        'word': w,
+                        'start': seg_start + idx * per_word_duration,
+                        'end': seg_start + (idx + 1) * per_word_duration,
+                    }
+                    for idx, w in enumerate(word_list)
+                ]
+            words = sorted(words, key=lambda x: x.get('start', 0.0))
+            prepared.append({'start': seg_start, 'end': seg_end, 'words': words})
+
+        prepared.sort(key=lambda s: s['start'])
+        if not prepared:
+            return video_clip
+
+        n = len(prepared)
+        context_n = max(0, int(style.context_lines))
+        upcoming_lead = max(0.0, float(style.upcoming_lead))
+        scroll_duration = max(0.0, float(style.scroll_duration))
+        clip_duration = video_clip.duration
+        fps = self.fps or DEFAULT_FPS
+        max_steps_per_word = 8
+        karaoke = style.highlight_style == 'karaoke'
+
+        def current_idx_at(t):
+            idx = None
+            for i, seg in enumerate(prepared):
+                if seg['start'] <= t:
+                    idx = i
+                else:
+                    break
+            return idx
+
+        def build_window(cur, t):
+            """The lines visible at time t if `cur` were the current line."""
+            window = []
+            if cur is None:
+                for j in range(0, min(context_n, n)):
+                    seg = prepared[j]
+                    if t >= seg['start'] - upcoming_lead:
+                        window.append((j, seg, False))
+                    else:
+                        break
+            else:
+                for j in range(max(0, cur - context_n), cur):
+                    window.append((j, prepared[j], False))
+                window.append((cur, prepared[cur], True))
+                for j in range(cur + 1, min(n, cur + 1 + context_n)):
+                    seg = prepared[j]
+                    if t >= seg['start'] - upcoming_lead:
+                        window.append((j, seg, False))
+                    else:
+                        break
+            return window
+
+        boundaries = {0.0, clip_duration}
+        for seg in prepared:
+            boundaries.add(max(0.0, seg['start']))
+            boundaries.add(min(clip_duration, seg['end']))
+            boundaries.add(max(0.0, seg['start'] - upcoming_lead))
+            for w in seg['words']:
+                w_start = max(seg['start'], min(w.get('start', 0.0), seg['end']))
+                w_end = max(seg['start'], min(w.get('end', 0.0), seg['end']))
+                boundaries.add(w_start)
+                boundaries.add(w_end)
+                if karaoke and w_end > w_start:
+                    step_count = max(1, min(max_steps_per_word, int(round((w_end - w_start) * fps))))
+                    step = (w_end - w_start) / step_count
+                    boundaries.update(w_start + i * step for i in range(1, step_count))
+
+        if scroll_duration > 0:
+            scroll_steps = max(1, min(12, int(round(scroll_duration * fps))))
+            for i in range(1, n):
+                t0 = prepared[i]['start']
+                t_end = min(clip_duration, t0 + scroll_duration)
+                step = (t_end - t0) / scroll_steps
+                boundaries.update(t0 + k * step for k in range(scroll_steps + 1))
+
+        boundaries = sorted(b for b in boundaries if 0.0 <= b <= clip_duration)
+
+        # Merge boundaries closer than a frame apart -- otherwise the tiny
+        # interval between them gets skipped below, and if that gap lands
+        # on an encoded frame it renders blank.
+        if len(boundaries) > 1:
+            min_gap = 1.0 / fps
+            merged = [boundaries[0]]
+            for b in boundaries[1:]:
+                if b - merged[-1] >= min_gap:
+                    merged.append(b)
+            if merged[-1] != boundaries[-1]:
+                merged[-1] = boundaries[-1]
+            boundaries = merged
+
+        text_clips = []
+        try:
+            for idx in range(len(boundaries) - 1):
+                t1, t2 = boundaries[idx], boundaries[idx + 1]
+                dur = t2 - t1
+                if dur < 0.01:
+                    continue
+                mid = (t1 + t2) / 2.0
+                cur = current_idx_at(mid)
+
+                in_transition = (
+                    scroll_duration > 0 and cur is not None and cur > 0
+                    and (mid - prepared[cur]['start']) < scroll_duration
+                )
+
+                if in_transition:
+                    p = max(0.0, min(1.0, (mid - prepared[cur]['start']) / scroll_duration))
+                    window_prev = build_window(cur - 1, mid)
+                    window_next = build_window(cur, mid)
+                    frame_img, (frame_x, frame_y) = self._render_scrolling_lyrics_transition_frame_pil(
+                        video_clip.w, video_clip.h, window_prev, window_next, p, mid, style,
+                    )
+                else:
+                    window = build_window(cur, mid)
+                    if not window:
+                        continue
+                    frame_img, (frame_x, frame_y) = self._render_scrolling_lyrics_frame_pil(
+                        video_clip.w, video_clip.h, window, mid, style,
+                    )
+                frame_arr = np.array(frame_img)
+                if frame_arr.size == 0:
+                    continue
+
+                rgb_arr = frame_arr[:, :, :3]
+                alpha_arr = (frame_arr[:, :, 3] / 255.0).astype(np.float32)
+
+                img_clip = ImageClip(rgb_arr)
+                mask_clip = ImageClip(alpha_arr, is_mask=True)
+                img_clip = img_clip.with_mask(mask_clip)
+                img_clip = img_clip.with_start(t1).with_duration(dur).with_position((frame_x, frame_y))
+                text_clips.append(img_clip)
+
+        except Exception as e:
+            print(f"Error rendering scrolling lyrics frames: {e}")
+            traceback.print_exc()
+            for clip in text_clips:
+                try:
+                    clip.close()
+                except:
+                    pass
+            return None
+
+        print(f"DEBUG: Created {len(text_clips)} scrolling-lyrics text clips")
+        if not text_clips:
+            return video_clip
+
+        try:
+            print("DEBUG: Compositing video with scrolling lyrics clips...")
+            final_clip = CompositeVideoClip([video_clip] + text_clips)
+            if video_clip.audio:
+                final_clip = final_clip.with_audio(video_clip.audio)
+            return final_clip
+
+        except Exception as e:
+            print(f"Error compositing video with scrolling lyrics: {e}")
+            for clip in text_clips:
+                try:
+                    clip.close()
+                except:
+                    pass
+            return None
+
+    def _layout_lyric_row(self, words: List[Dict], font: ImageFont.FreeTypeFont, max_w: int, get_word_size) -> List[List[Tuple[Dict, int, int]]]:
+        """Wrap one lyric line's words into physical lines that fit max_w."""
+        lines = []
+        current_line = []
+        current_line_w = 0
+        for idx, w_dict in enumerate(words):
+            word_text = w_dict.get('word', '').strip()
+            if not word_text:
+                continue
+            measure_text = word_text + " "
+            w_width, _ = get_word_size(measure_text)
+            if current_line_w + w_width > max_w and current_line:
+                lines.append(current_line)
+                current_line = [(w_dict, idx, w_width)]
+                current_line_w = w_width
+            else:
+                current_line.append((w_dict, idx, w_width))
+                current_line_w += w_width
+        if current_line:
+            lines.append(current_line)
+        return lines
+
+    def _compute_scroll_geometry(self, window: List[Tuple[int, Dict, bool]], width: int, height: int, style: TextStyle, draw: ImageDraw.ImageDraw):
+        """Wrap and stack window's rows vertically around the current row's
+        anchor position. Returns (rows, font_path, center_x); each row dict
+        is keyed by 'seg_index' so two geometries can be blended row-for-row."""
+        font_path = self._get_font_path(style.get_font_for_language())
+        max_w = int(width * (style.box_size[0] or 0.8))
+
+        def get_word_size(text, font):
+            if hasattr(draw, 'textbbox'):
+                bbox = draw.textbbox((0, 0), text, font=font)
+                return bbox[2] - bbox[0], bbox[3] - bbox[1]
+            elif hasattr(font, 'getbbox'):
+                bbox = font.getbbox(text)
+                return bbox[2] - bbox[0], bbox[3] - bbox[1]
+            return font.getsize(text)
+
+        try:
+            current_font = ImageFont.truetype(font_path, style.font_size)
+        except Exception:
+            current_font = ImageFont.load_default()
+        context_font_size = max(10, int(style.font_size * style.context_font_scale))
+        try:
+            context_font = ImageFont.truetype(font_path, context_font_size)
+        except Exception:
+            context_font = current_font
+
+        _, current_sample_h = get_word_size("Ay", current_font)
+        _, context_sample_h = get_word_size("Ay", context_font)
+        current_line_h = int(current_sample_h * 1.3)
+        context_line_h = int(context_sample_h * 1.3)
+        row_gap = int(context_line_h * 0.35)
+
+        rows = []
+        for seg_index, seg, is_current in window:
+            font = current_font if is_current else context_font
+            font_size = style.font_size if is_current else context_font_size
+            line_h = current_line_h if is_current else context_line_h
+            phys_lines = self._layout_lyric_row(seg['words'], font, max_w, lambda t, f=font: get_word_size(t, f))
+            if not phys_lines:
+                continue
+            rows.append({
+                'seg_index': seg_index, 'is_current': is_current, 'font_size': font_size,
+                'line_h': line_h, 'phys_lines': phys_lines, 'block_h': len(phys_lines) * line_h,
+            })
+
+        if not rows:
+            return [], font_path, width // 2
+
+        pos_x, pos_y = style.text_position
+        box_w = max_w
+
+        if isinstance(pos_x, str):
+            pos_x_lower = pos_x.lower()
+            if pos_x_lower == 'left':
+                center_x = box_w // 2
+            elif pos_x_lower == 'right':
+                center_x = width - box_w // 2
+            else:
+                center_x = width // 2
+        elif isinstance(pos_x, (int, float)):
+            if 0.0 <= pos_x <= 1.0:
+                if pos_x == 0.5:
+                    center_x = width // 2
+                elif pos_x < 0.4:
+                    center_x = int(width * (pos_x + (style.box_size[0] or 0.8) / 2))
+                else:
+                    center_x = int(width * pos_x)
+            else:
+                if pos_x < width * 0.4:
+                    center_x = int(pos_x + box_w // 2)
+                else:
+                    center_x = int(pos_x)
+        else:
+            center_x = width // 2
+
+        current_i = next((i for i, r in enumerate(rows) if r['is_current']), len(rows) // 2)
+        current_block_h = rows[current_i]['block_h']
+
+        if isinstance(pos_y, str):
+            pos_y_lower = pos_y.lower()
+            if pos_y_lower == 'top':
+                current_center_y = int(height * 0.05) + current_block_h // 2
+            elif pos_y_lower == 'bottom':
+                current_center_y = height - int(height * 0.05) - current_block_h // 2
+            else:
+                current_center_y = height // 2
+        elif isinstance(pos_y, (int, float)):
+            current_center_y = int(height * pos_y) if 0.0 <= pos_y <= 1.0 else int(pos_y)
+        else:
+            current_center_y = height // 2
+
+        row_tops = [0] * len(rows)
+        row_tops[current_i] = current_center_y - current_block_h // 2
+
+        y = row_tops[current_i]
+        for i in range(current_i - 1, -1, -1):
+            y -= row_gap + rows[i]['block_h']
+            row_tops[i] = y
+
+        y = row_tops[current_i] + current_block_h
+        for i in range(current_i + 1, len(rows)):
+            row_tops[i] = y + row_gap
+            y = row_tops[i] + rows[i]['block_h']
+
+        for r, top in zip(rows, row_tops):
+            r['top'] = top
+
+        return rows, font_path, center_x
+
+    def _draw_lyric_row_block(self, img: Image.Image, draw: ImageDraw.ImageDraw, phys_lines, top: float, font: ImageFont.FreeTypeFont, line_h: int, alpha: int, center_x: int, is_current_style: bool, current_time: Optional[float], style: TextStyle, bounds: list) -> None:
+        """Draw one lyric row's wrapped lines at the given top/font/alpha,
+        with word highlighting only when is_current_style. Word widths are
+        measured against `font`, not whatever font the row was wrapped
+        with, so an interpolated size during a transition stays centered.
+        Mutates bounds ([min_x, min_y, max_x, max_y], None until first write)."""
+        if alpha <= 0:
+            return
+
+        highlight_color = getattr(style, 'highlight_color', '#FFD700')
+        font_color = style.font_color or 'white'
+        stroke_color = style.stroke_color or 'black'
+        stroke_width = style.stroke_width or 0
+        karaoke = style.highlight_style == 'karaoke'
+        alpha = max(0, min(255, int(round(alpha))))
+
+        def with_alpha(color_str):
+            rgb = ImageColor.getrgb(color_str)[:3]
+            return (rgb[0], rgb[1], rgb[2], alpha)
+
+        row_font_color = with_alpha(font_color)
+        row_stroke_color = with_alpha(stroke_color)
+        row_highlight_color = with_alpha(highlight_color)
+
+        def get_word_size(text):
+            if hasattr(draw, 'textbbox'):
+                bbox = draw.textbbox((0, 0), text, font=font)
+                return bbox[2] - bbox[0], bbox[3] - bbox[1]
+            elif hasattr(font, 'getbbox'):
+                bbox = font.getbbox(text)
+                return bbox[2] - bbox[0], bbox[3] - bbox[1]
+            return font.getsize(text)
+
+        curr_y = int(round(top))
+        for phys_line in phys_lines:
+            widths = [get_word_size(w_dict.get('word', '') + " ")[0] for w_dict, _idx, _old_w in phys_line]
+            line_w = sum(widths)
+            line_x = center_x - line_w // 2
+            curr_x = line_x
+
+            for (w_dict, w_idx, _old_w), w_width in zip(phys_line, widths):
+                word_text = w_dict.get('word', '')
+
+                if is_current_style and karaoke and current_time is not None:
+                    w_start = w_dict.get('start', 0.0)
+                    w_end = w_dict.get('end', 0.0)
+                    if current_time >= w_end:
+                        progress = 1.0
+                    elif current_time <= w_start or w_end <= w_start:
+                        progress = 0.0
+                    else:
+                        progress = (current_time - w_start) / (w_end - w_start)
+
+                    draw.text(
+                        (curr_x, curr_y), word_text + " ", fill=row_font_color,
+                        font=font, stroke_width=stroke_width, stroke_fill=row_stroke_color,
+                    )
+                    fill_w = int(round(w_width * progress))
+                    if fill_w > 0:
+                        ov_pad = stroke_width + 4
+                        ov_left = curr_x
+                        ov_top = max(0, curr_y - ov_pad)
+                        ov_w = w_width + ov_pad
+                        ov_h = line_h + 2 * ov_pad
+                        overlay = Image.new("RGBA", (ov_w, ov_h), (0, 0, 0, 0))
+                        ImageDraw.Draw(overlay).text(
+                            (0, curr_y - ov_top), word_text + " ", fill=row_highlight_color,
+                            font=font, stroke_width=stroke_width, stroke_fill=row_stroke_color,
+                        )
+                        region = overlay.crop((0, 0, min(fill_w, ov_w), ov_h))
+                        img.paste(region, (ov_left, ov_top), region)
+                elif is_current_style:
+                    w_start = w_dict.get('start', 0.0)
+                    w_end = w_dict.get('end', 0.0)
+                    is_active = current_time is not None and w_start <= current_time <= w_end
+                    draw.text(
+                        (curr_x, curr_y), word_text + " ",
+                        fill=row_highlight_color if is_active else row_font_color,
+                        font=font, stroke_width=stroke_width, stroke_fill=row_stroke_color,
+                    )
+                else:
+                    draw.text(
+                        (curr_x, curr_y), word_text + " ", fill=row_font_color,
+                        font=font, stroke_width=stroke_width, stroke_fill=row_stroke_color,
+                    )
+
+                curr_x += w_width
+
+            row_left, row_right = line_x, line_x + line_w
+            row_min_y, row_max_y = curr_y, curr_y + line_h
+            bounds[0] = row_left if bounds[0] is None else min(bounds[0], row_left)
+            bounds[2] = row_right if bounds[2] is None else max(bounds[2], row_right)
+            bounds[1] = row_min_y if bounds[1] is None else min(bounds[1], row_min_y)
+            bounds[3] = row_max_y if bounds[3] is None else max(bounds[3], row_max_y)
+
+            curr_y += line_h
+
+    def _crop_to_bounds(self, img: Image.Image, width: int, height: int, bounds: list, style: TextStyle) -> Tuple[Image.Image, Tuple[int, int]]:
+        """Shared crop-to-content-bounding-box tail for both scrolling
+        renderers -- see _render_text_frame_pil's docstring for why cropping
+        (not the full canvas) matters here."""
+        if bounds[0] is None:
+            return img, (0, 0)
+        stroke_width = style.stroke_width or 0
+        pad = stroke_width + max(4, int(style.font_size * 0.3))
+        left = max(0, int(bounds[0]) - pad)
+        top = max(0, int(bounds[1]) - pad)
+        right = min(width, int(bounds[2]) + pad)
+        bottom = min(height, int(bounds[3]) + pad)
+        if right <= left or bottom <= top:
+            return img, (0, 0)
+        return img.crop((left, top, right, bottom)), (left, top)
+
+    def _render_scrolling_lyrics_frame_pil(self, width: int, height: int, window: List[Tuple[int, Dict, bool]], current_time: Optional[float], style: TextStyle) -> Tuple[Image.Image, Tuple[int, int]]:
+        """Render one settled (non-transitioning) frame of the scrolling
+        display. window: (seg_index, seg, is_current) tuples top-to-bottom,
+        exactly one is_current row. Returns (image, (x, y)) cropped to
+        content's bounding box."""
+        img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+
+        rows, font_path, center_x = self._compute_scroll_geometry(window, width, height, style, draw)
+        if not rows:
+            return img, (0, 0)
+
+        fonts_cache: Dict[int, ImageFont.FreeTypeFont] = {}
+
+        def get_font(size):
+            size = max(6, int(round(size)))
+            if size not in fonts_cache:
+                try:
+                    fonts_cache[size] = ImageFont.truetype(font_path, size)
+                except Exception:
+                    fonts_cache[size] = ImageFont.load_default()
+            return fonts_cache[size]
+
+        context_alpha = max(0, min(255, int(round(style.context_opacity * 255))))
+        bounds = [None, None, None, None]
+        for r in rows:
+            self._draw_lyric_row_block(
+                img, draw, r['phys_lines'], r['top'], get_font(r['font_size']),
+                r['line_h'], 255 if r['is_current'] else context_alpha, center_x,
+                r['is_current'], current_time, style, bounds,
+            )
+
+        return self._crop_to_bounds(img, width, height, bounds, style)
+
+    def _render_scrolling_lyrics_transition_frame_pil(self, width: int, height: int, window_prev: List[Tuple[int, Dict, bool]], window_next: List[Tuple[int, Dict, bool]], p: float, current_time: Optional[float], style: TextStyle) -> Tuple[Image.Image, Tuple[int, int]]:
+        """Render one frame of a line-change transition at progress p in
+        [0, 1], blending window_prev's settled geometry into window_next's.
+        A line present in both windows interpolates position/size/opacity
+        continuously; a line present in only one fades in/out in place."""
+        img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+
+        rows_prev, font_path, _center_x_prev = self._compute_scroll_geometry(window_prev, width, height, style, draw)
+        rows_next, font_path, center_x = self._compute_scroll_geometry(window_next, width, height, style, draw)
+
+        by_prev = {r['seg_index']: r for r in rows_prev}
+        by_next = {r['seg_index']: r for r in rows_next}
+        context_alpha = max(0, min(255, int(round(style.context_opacity * 255))))
+
+        fonts_cache: Dict[int, ImageFont.FreeTypeFont] = {}
+
+        def get_font(size):
+            size = max(6, int(round(size)))
+            if size not in fonts_cache:
+                try:
+                    fonts_cache[size] = ImageFont.truetype(font_path, size)
+                except Exception:
+                    fonts_cache[size] = ImageFont.load_default()
+            return fonts_cache[size]
+
+        bounds = [None, None, None, None]
+        for seg_index in sorted(set(by_prev) | set(by_next)):
+            rp = by_prev.get(seg_index)
+            rn = by_next.get(seg_index)
+
+            if rp and rn:
+                top = rp['top'] + (rn['top'] - rp['top']) * p
+                font_size = rp['font_size'] + (rn['font_size'] - rp['font_size']) * p
+                alpha_p = 255 if rp['is_current'] else context_alpha
+                alpha_n = 255 if rn['is_current'] else context_alpha
+                alpha = alpha_p + (alpha_n - alpha_p) * p
+                phys_lines = rn['phys_lines']
+                is_current_style = rp['is_current'] or rn['is_current']
+            elif rn:
+                # newly entering the window -- fade in rather than glide from nowhere
+                top = rn['top']
+                font_size = rn['font_size']
+                alpha = (255 if rn['is_current'] else context_alpha) * p
+                phys_lines = rn['phys_lines']
+                is_current_style = rn['is_current']
+            else:
+                # leaving the window -- fade out in place
+                top = rp['top']
+                font_size = rp['font_size']
+                alpha = (255 if rp['is_current'] else context_alpha) * (1 - p)
+                phys_lines = rp['phys_lines']
+                is_current_style = rp['is_current']
+
+            if alpha <= 1:
+                continue
+
+            line_h = int(font_size * 1.3)
+            self._draw_lyric_row_block(
+                img, draw, phys_lines, top, get_font(font_size), line_h,
+                alpha, center_x, is_current_style, current_time, style, bounds,
+            )
+
+        return self._crop_to_bounds(img, width, height, bounds, style)
 
     def _create_advanced_segments_video_clip(self) -> Optional[VideoFileClip]:
         """Create a video clip from advanced segments with intelligent caching."""

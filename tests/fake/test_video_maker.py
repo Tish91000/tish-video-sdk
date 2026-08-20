@@ -148,6 +148,31 @@ class TestTextStyle:
             TextStyle(highlight_color='not_a_color')
 
 
+class TestFontResolution:
+    """Language-specific font choices must be driven entirely by config
+    (SubtitlePack -> TextStyle), and a font name listing several fallback
+    variants must resolve to a real font file rather than silently falling
+    back to a default."""
+
+    def test_get_font_for_language_returns_configured_font_family(self):
+        style = TextStyle(language_code='ta', font_family='Some-Custom-Font')
+        assert style.get_font_for_language() == 'Some-Custom-Font'
+
+    @patch('tish_video_sdk.video_maker.os.path.exists')
+    def test_get_font_path_resolves_ampersand_joined_fallback_chain(self, mock_exists):
+        # Fonts dir exists; only Nirmala.ttc exists on disk (its real-world
+        # layout -- Windows ships Nirmala as a single .ttc, not .ttf).
+        mock_exists.side_effect = lambda p: p.lower().endswith(('fonts', 'nirmala.ttc'))
+
+        builder = VideoBuilder()
+        path = builder._get_font_path(
+            'Nirmala-UI-&-Nirmala-UI-Bold-&-Nirmala-UI-Semilight-&-'
+            'Nirmala-Text-&-Nirmala-Text-Bold-&-Nirmala-Text-Semilight'
+        )
+        # The first variant in the chain must resolve to its real font file.
+        assert path.lower().endswith('nirmala.ttc')
+
+
 class TestTextSegments:
     def test_with_text_segments_returns_self(self):
         builder = VideoBuilder()

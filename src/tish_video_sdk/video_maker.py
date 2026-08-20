@@ -55,12 +55,6 @@ DEFAULT_STROKE_WIDTH = 3
 DEFAULT_FONT_FAMILY = 'Arial-Bold'
 DEFAULT_BOX_SIZE = (0.8, None)
 
-# Specific font mapping for certain languages (e.g., Tamil requires a different font)
-FONT_FAMILY_BY_LANGUAGE = {
-    'ta': 'Nirmala-UI-&-Nirmala-UI-Bold-&-Nirmala-UI-Semilight-&-Nirmala-Text-&-Nirmala-Text-Bold-&-Nirmala-Text-Semilight',
-    'default': DEFAULT_FONT_FAMILY,
-}
-
 
 @dataclass
 class TextStyle:
@@ -82,8 +76,9 @@ class TextStyle:
     language_code: str = 'en'
 
     def get_font_for_language(self) -> str:
-        """Return appropriate font family for the language."""
-        return FONT_FAMILY_BY_LANGUAGE.get(self.language_code, self.font_family)
+        """Return this style's font family, as resolved from configuration
+        (see SubtitlePack) for the current language."""
+        return self.font_family
 
     def __post_init__(self):
         if self.font_size <= 0:
@@ -1067,8 +1062,11 @@ class VideoBuilder:
 
     def _get_font_path(self, font_name: str) -> str:
         """Find the font file path on Windows."""
-        # Clean font name
-        cleaned = font_name.split('&')[0].strip() # Handle language specific combinations if any
+        # A font name may list several fallback variants joined by '-&-'
+        # (some languages need more than one); use the first variant, and
+        # trim stray separator hyphens along with whitespace so it still
+        # matches the lookup table below.
+        cleaned = font_name.split('&')[0].strip().strip('-')
 
         # Try standard Windows Fonts folder
         win_dir = os.environ.get('SystemRoot', 'C:\\Windows')

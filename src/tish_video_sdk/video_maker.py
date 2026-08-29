@@ -15,7 +15,7 @@ from moviepy import (
 from moviepy.video.fx import MaskColor, Loop
 import numpy as np
 from dataclasses import dataclass
-from PIL import Image, ImageColor, ImageDraw, ImageFont
+from PIL import Image, ImageColor, ImageDraw, ImageFilter, ImageFont
 import uuid # For unique temp filenames
 import traceback # Debugging
 
@@ -91,6 +91,14 @@ class TextStyle:
     # Seconds the scrolling display takes to glide to the next current line
     # (position/size/opacity ease smoothly); 0 snaps instantly.
     scroll_duration: float = 0.35
+    # Neon/glow look: a blurred halo drawn behind a word's highlighted
+    # portion (never behind still-unlit text). 0 glow_radius (default)
+    # draws no glow, byte-identical to before this existed; >0 is the
+    # Gaussian blur radius in px. glow_color defaults to None, which means
+    # "use highlight_color" -- set it to use a different glow color than
+    # the highlight color itself.
+    glow_radius: int = 0
+    glow_color: Optional[str] = None
 
     def get_font_for_language(self) -> str:
         """Return this style's font family, as resolved from configuration
@@ -133,6 +141,13 @@ class TextStyle:
             raise ValueError("upcoming_lead must be non-negative")
         if self.scroll_duration < 0:
             raise ValueError("scroll_duration must be non-negative")
+        if self.glow_radius < 0:
+            raise ValueError("glow_radius must be non-negative")
+        if self.glow_color:
+            try:
+                ImageColor.getrgb(self.glow_color)
+            except ValueError:
+                raise ValueError(f"Invalid glow_color: {self.glow_color}")
 
 
 class VideoBuilder:
@@ -188,6 +203,15 @@ class VideoBuilder:
         self._audio_cache: Dict[str, Dict] = {}
         self._video_cache: Dict[str, VideoFileClip] = {}
         self._bgm_cache: Dict[str, AudioFileClip] = {}
+
+        # A highlighted word's blurred glow halo (TextStyle.glow_radius, in
+        # highlight_color) is invariant across the many re-renders karaoke
+        # word-highlight animation does of that word's crisp foreground --
+        # cached by _paste_word_glow to avoid re-blurring on every one of
+        # those calls. Stores only the layer image itself (not its paste
+        # position, which is recomputed fresh every call -- see that
+        # method's docstring).
+        self._glow_cache: Dict[tuple, Image.Image] = {}
 
     @classmethod
     def from_single_image_with_audio(cls, image_filepath: str, audio_filepath: str, fps: int = DEFAULT_FPS, width: int = 1080, height: int = 1920) -> 'VideoBuilder':
@@ -1155,6 +1179,61 @@ class VideoBuilder:
         # Default fallback
         return os.path.join(fonts_dir, 'arial.ttf')
 
+    def _paste_word_glow(self, img: Image.Image, text: str, font: ImageFont.FreeTypeFont, x: float, y: float, word_width: float, line_h: int, glow_color, glow_radius: int, crop_w: Optional[float] = None) -> None:
+        """Paste a blurred glow_color halo (a 'neon' look) behind one
+        word's HIGHLIGHTED portion at (x, y) in img's coordinate space.
+        glow_color may be a color string or an RGBA tuple (PIL accepts
+        both as a text fill). Glow marks highlighted text specifically --
+        callers only reach this for a word (or the already-filled part of
+        one, via crop_w) that's actually being painted in highlight_color
+        right now, never for text still sitting in its unlit font_color.
+
+        Cached per (text, font identity, glow_color, glow_radius) as a
+        small layer in its own LOCAL coordinate space, not this call's
+        (x, y) -- karaoke word-highlight animation re-renders a word's
+        crisp foreground many times a second (once per active-word
+        sub-interval) while its glow's pixel content never changes, so
+        re-blurring it on every one of those calls would be pure waste,
+        but the paste position is always recomputed fresh from this call's
+        (x, y), or a stale position from an earlier frame would paste
+        today's glow in yesterday's place (a line's context-row slot
+        slides as the song advances; a transition interpolates it).
+
+        crop_w, when given, trims the CACHED layer's width at paste time
+        so a karaoke word's glow grows in sync with its own progressive
+        color fill without needing a fresh blur per progress value --
+        mirrors the crisp fill's own overlay-crop-paste technique. The
+        layer's local frame is [pad][word_width][pad] (left margin, glyph,
+        right margin, each `pad` wide -- see below), so the crop needs
+        `pad` on BOTH sides of crop_w: `pad` to keep the layer's own left
+        margin (always present, even at the very first sliver of fill) and
+        another `pad` so the blur's softness actually shows past the crisp
+        fill edge rather than being clipped flush against it. At
+        crop_w == word_width (a finished word) this evaluates to the full
+        layer width, so a finished word's glow is exactly as symmetric as
+        one pasted with crop_w=None."""
+        if glow_radius <= 0:
+            return
+        pad = glow_radius * 3
+        cache_key = (text, getattr(font, 'path', 'default'), font.size, glow_color, glow_radius)
+        layer = self._glow_cache.get(cache_key)
+        if layer is None:
+            w = max(1, int(round(word_width)) + 2 * pad)
+            h = max(1, line_h + 2 * pad)
+            layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+            ImageDraw.Draw(layer).text((pad, pad), text, fill=glow_color, font=font)
+            layer = layer.filter(ImageFilter.GaussianBlur(glow_radius))
+            self._glow_cache[cache_key] = layer
+
+        paste_layer = layer
+        if crop_w is not None:
+            crop_px = min(layer.width, max(0, int(round(crop_w)) + 2 * pad))
+            if crop_px <= 0:
+                return
+            paste_layer = layer.crop((0, 0, crop_px, layer.height))
+
+        img.paste(paste_layer, (int(round(x - pad)), int(round(y - pad))), paste_layer)
+
     def _render_text_frame_pil(self, width: int, height: int, words: List[Dict], active_word_idx: Optional[int], style: TextStyle, has_word_timestamps: bool = True, current_time: Optional[float] = None) -> Tuple[Image.Image, Tuple[int, int]]:
         """
         Renders a single frame of text using PIL.
@@ -1354,11 +1433,14 @@ class VideoBuilder:
         stroke_color = style.stroke_color or 'black'
         stroke_width = style.stroke_width or 0
         karaoke = has_word_timestamps and style.highlight_style == 'karaoke' and current_time is not None
+        glow_radius = style.glow_radius
+        glow_color = style.glow_color or highlight_color
 
         for line, line_w, line_x, line_y in line_info:
             curr_x = line_x
             for w_dict, is_active, idx, w_width in line:
                 word_text = w_dict.get('word', '')
+                draw_text = word_text + " "
 
                 if karaoke:
                     # Cumulative + progressive: words already finished stay
@@ -1374,11 +1456,21 @@ class VideoBuilder:
                     else:
                         progress = (current_time - w_start) / (w_end - w_start)
 
+                    fill_w = int(round(w_width * progress))
+                    # Glow only the already-highlighted portion, drawn
+                    # before the crisp text so it sits behind it -- see
+                    # _paste_word_glow's docstring for why this is cheap
+                    # even under karaoke's per-sub-interval re-rendering.
+                    if glow_radius > 0 and fill_w > 0:
+                        self._paste_word_glow(
+                            img, draw_text, font, curr_x, line_y, w_width, line_height,
+                            glow_color, glow_radius, crop_w=fill_w,
+                        )
+
                     draw.text(
-                        (curr_x, line_y), word_text + " ", fill=font_color,
+                        (curr_x, line_y), draw_text, fill=font_color,
                         font=font, stroke_width=stroke_width, stroke_fill=stroke_color,
                     )
-                    fill_w = int(round(w_width * progress))
                     if fill_w > 0:
                         # Word-sized overlay, not img.size -- this runs once
                         # per active-word sub-interval (many per word under
@@ -1392,7 +1484,7 @@ class VideoBuilder:
                         ov_h = line_height + 2 * ov_pad
                         overlay = Image.new("RGBA", (ov_w, ov_h), (0, 0, 0, 0))
                         ImageDraw.Draw(overlay).text(
-                            (0, line_y - ov_top), word_text + " ", fill=highlight_color,
+                            (0, line_y - ov_top), draw_text, fill=highlight_color,
                             font=font, stroke_width=stroke_width, stroke_fill=stroke_color,
                         )
                         region = overlay.crop((0, 0, min(fill_w, ov_w), ov_h))
@@ -1400,9 +1492,14 @@ class VideoBuilder:
                 else:
                     # Active word highlight color, else normal font color
                     color = highlight_color if is_active else font_color
+                    if glow_radius > 0 and is_active:
+                        self._paste_word_glow(
+                            img, draw_text, font, curr_x, line_y, w_width, line_height,
+                            glow_color, glow_radius,
+                        )
                     draw.text(
                         (curr_x, line_y),
-                        word_text + " ",
+                        draw_text,
                         fill=color,
                         font=font,
                         stroke_width=stroke_width,
@@ -1415,6 +1512,10 @@ class VideoBuilder:
         # method's docstring for why (memory: many small arrays instead of
         # many full-canvas ones).
         pad = stroke_width + max(4, int(resolved_font_size * 0.3))
+        if style.glow_radius > 0:
+            # Match _paste_word_glow's own layer padding, or the glow's
+            # outer edge gets clipped by this crop.
+            pad = max(pad, style.glow_radius * 3)
         min_x = min(info[2] for info in line_info)
         max_x = max(info[2] + info[1] for info in line_info)
         min_y = y_start
@@ -1962,6 +2063,10 @@ class VideoBuilder:
                 return bbox[2] - bbox[0], bbox[3] - bbox[1]
             return font.getsize(text)
 
+        # Layout pass: resolve every word's (x, y) once, shared by the glow
+        # pre-pass below and the crisp draw pass that follows it -- avoids
+        # measuring word widths twice.
+        positions = []  # (x, y, word_text, w_dict, w_width)
         curr_y = int(round(top))
         for phys_line in phys_lines:
             widths = [get_word_size(w_dict.get('word', '') + " ")[0] for w_dict, _idx, _old_w in phys_line]
@@ -1969,52 +2074,8 @@ class VideoBuilder:
             line_x = center_x - line_w // 2
             curr_x = line_x
 
-            for (w_dict, w_idx, _old_w), w_width in zip(phys_line, widths):
-                word_text = w_dict.get('word', '')
-
-                if is_current_style and karaoke and current_time is not None:
-                    w_start = w_dict.get('start', 0.0)
-                    w_end = w_dict.get('end', 0.0)
-                    if current_time >= w_end:
-                        progress = 1.0
-                    elif current_time <= w_start or w_end <= w_start:
-                        progress = 0.0
-                    else:
-                        progress = (current_time - w_start) / (w_end - w_start)
-
-                    draw.text(
-                        (curr_x, curr_y), word_text + " ", fill=row_font_color,
-                        font=font, stroke_width=stroke_width, stroke_fill=row_stroke_color,
-                    )
-                    fill_w = int(round(w_width * progress))
-                    if fill_w > 0:
-                        ov_pad = stroke_width + 4
-                        ov_left = curr_x
-                        ov_top = max(0, curr_y - ov_pad)
-                        ov_w = w_width + ov_pad
-                        ov_h = line_h + 2 * ov_pad
-                        overlay = Image.new("RGBA", (ov_w, ov_h), (0, 0, 0, 0))
-                        ImageDraw.Draw(overlay).text(
-                            (0, curr_y - ov_top), word_text + " ", fill=row_highlight_color,
-                            font=font, stroke_width=stroke_width, stroke_fill=row_stroke_color,
-                        )
-                        region = overlay.crop((0, 0, min(fill_w, ov_w), ov_h))
-                        img.paste(region, (ov_left, ov_top), region)
-                elif is_current_style:
-                    w_start = w_dict.get('start', 0.0)
-                    w_end = w_dict.get('end', 0.0)
-                    is_active = current_time is not None and w_start <= current_time <= w_end
-                    draw.text(
-                        (curr_x, curr_y), word_text + " ",
-                        fill=row_highlight_color if is_active else row_font_color,
-                        font=font, stroke_width=stroke_width, stroke_fill=row_stroke_color,
-                    )
-                else:
-                    draw.text(
-                        (curr_x, curr_y), word_text + " ", fill=row_font_color,
-                        font=font, stroke_width=stroke_width, stroke_fill=row_stroke_color,
-                    )
-
+            for (w_dict, _w_idx, _old_w), w_width in zip(phys_line, widths):
+                positions.append((curr_x, curr_y, w_dict.get('word', ''), w_dict, w_width))
                 curr_x += w_width
 
             row_left, row_right = line_x, line_x + line_w
@@ -2026,6 +2087,68 @@ class VideoBuilder:
 
             curr_y += line_h
 
+        glow_radius = style.glow_radius
+        row_glow_color = with_alpha(style.glow_color or highlight_color) if glow_radius > 0 else None
+
+        for curr_x, curr_y, word_text, w_dict, w_width in positions:
+            draw_text = word_text + " "
+            if is_current_style and karaoke and current_time is not None:
+                w_start = w_dict.get('start', 0.0)
+                w_end = w_dict.get('end', 0.0)
+                if current_time >= w_end:
+                    progress = 1.0
+                elif current_time <= w_start or w_end <= w_start:
+                    progress = 0.0
+                else:
+                    progress = (current_time - w_start) / (w_end - w_start)
+
+                fill_w = int(round(w_width * progress))
+                # Glow only the already-highlighted portion, drawn before
+                # the crisp text so it sits behind it -- growing in sync
+                # with the fill via crop_w, not a fresh blur per frame.
+                if row_glow_color is not None and fill_w > 0:
+                    self._paste_word_glow(
+                        img, draw_text, font, curr_x, curr_y, w_width, line_h,
+                        row_glow_color, glow_radius, crop_w=fill_w,
+                    )
+
+                draw.text(
+                    (curr_x, curr_y), draw_text, fill=row_font_color,
+                    font=font, stroke_width=stroke_width, stroke_fill=row_stroke_color,
+                )
+                if fill_w > 0:
+                    ov_pad = stroke_width + 4
+                    ov_left = curr_x
+                    ov_top = max(0, curr_y - ov_pad)
+                    ov_w = w_width + ov_pad
+                    ov_h = line_h + 2 * ov_pad
+                    overlay = Image.new("RGBA", (ov_w, ov_h), (0, 0, 0, 0))
+                    ImageDraw.Draw(overlay).text(
+                        (0, curr_y - ov_top), draw_text, fill=row_highlight_color,
+                        font=font, stroke_width=stroke_width, stroke_fill=row_stroke_color,
+                    )
+                    region = overlay.crop((0, 0, min(fill_w, ov_w), ov_h))
+                    img.paste(region, (ov_left, ov_top), region)
+            elif is_current_style:
+                w_start = w_dict.get('start', 0.0)
+                w_end = w_dict.get('end', 0.0)
+                is_active = current_time is not None and w_start <= current_time <= w_end
+                if row_glow_color is not None and is_active:
+                    self._paste_word_glow(
+                        img, draw_text, font, curr_x, curr_y, w_width, line_h,
+                        row_glow_color, glow_radius,
+                    )
+                draw.text(
+                    (curr_x, curr_y), draw_text,
+                    fill=row_highlight_color if is_active else row_font_color,
+                    font=font, stroke_width=stroke_width, stroke_fill=row_stroke_color,
+                )
+            else:
+                draw.text(
+                    (curr_x, curr_y), draw_text, fill=row_font_color,
+                    font=font, stroke_width=stroke_width, stroke_fill=row_stroke_color,
+                )
+
     def _crop_to_bounds(self, img: Image.Image, width: int, height: int, bounds: list, style: TextStyle) -> Tuple[Image.Image, Tuple[int, int]]:
         """Shared crop-to-content-bounding-box tail for both scrolling
         renderers -- see _render_text_frame_pil's docstring for why cropping
@@ -2034,6 +2157,10 @@ class VideoBuilder:
             return img, (0, 0)
         stroke_width = style.stroke_width or 0
         pad = stroke_width + max(4, int(style.font_size * 0.3))
+        if style.glow_radius > 0:
+            # Match _paste_word_glow's own layer padding, or the glow's
+            # outer edge gets clipped by this crop.
+            pad = max(pad, style.glow_radius * 3)
         left = max(0, int(bounds[0]) - pad)
         top = max(0, int(bounds[1]) - pad)
         right = min(width, int(bounds[2]) + pad)

@@ -22,6 +22,10 @@ Demonstrates:
   you actually want to publish something. The commented sample also shows
   content_date/hour_of_day/utc_offset_hours as an alternative to spelling out
   publish_year/month/day/hour by hand.
+- Every publish_video()/publish_to_youtube()/publish_to_instagram() call
+  appends publisher_packs.SDK_CREDIT_LINE ("Made with TishVideoSDK by Cyril
+  PETER") to the description/caption unconditionally -- this credit is
+  compulsory and cannot be disabled.
 """
 import os
 

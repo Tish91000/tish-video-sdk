@@ -28,6 +28,18 @@ the target platform's pack. :meth:`Publisher.publish_to_youtube` and
 :meth:`Publisher.publish_to_instagram` are thin named wrappers over the same
 call, for IDE-friendliness.
 
+Every publish -- through :meth:`Publisher.publish_video` or either named
+wrapper -- appends
+:data:`~tish_video_sdk.internal.providers.publisher_packs.SDK_CREDIT_LINE`
+("Made with TishVideoSDK by Cyril PETER") to the description/caption
+unconditionally; this credit is compulsory and there is no way to opt out
+of it for a given call. A Jamendo-sourced background track's own required
+attribution (see
+:meth:`~tish_video_sdk.music.MusicManager.get_attribution_text`) is a
+separate credit line -- pass it through as extra description/caption text
+alongside the SDK credit, it is not added automatically here since
+:class:`Publisher` has no visibility into which track a video used.
+
 YouTube alone has operations with no Instagram equivalent -- comments,
 thumbnails, channel video listing, trending videos. Those live on
 :attr:`Publisher.youtube` (a
@@ -87,6 +99,8 @@ Usage
        "video.mp4", title="My Video", description="...", tags=["tag1", "tag2"],
        content_date=content_date, hour_of_day=21, utc_offset_hours=-2,
    )
+   # description becomes "...\n\nMade with TishVideoSDK by Cyril PETER" --
+   # this credit line is appended unconditionally and cannot be disabled.
    publisher.publish_to_instagram("video.mp4", caption="My caption")
 
    publisher.mark_published(content_date)  # once the caller decides this date is settled

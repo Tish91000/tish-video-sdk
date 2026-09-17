@@ -55,6 +55,12 @@ from tish_video_sdk.publisher import Publisher
 
 publisher = Publisher(youtube_client_secret_filepath="client_secret.json")
 publisher.publish_to_youtube("output.mp4", title="My Video", description="...", tags=["tag1"])
+# description becomes "...\n\nMade with TishVideoSDK by Cyril PETER" -- every
+# publish_video()/publish_to_youtube()/publish_to_instagram() call appends
+# this credit line unconditionally; it cannot be disabled.
+# A Jamendo-sourced background track (see add_background_music's return
+# value) similarly gets its own required credit line appended when you pass
+# it through as extra description/caption text.
 ```
 
 See the full API reference under `source/api/`.

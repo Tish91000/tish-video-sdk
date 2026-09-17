@@ -56,6 +56,30 @@ class TestPublisherPackRegistry:
         assert isinstance(pack, YouTubePublisherPack)
 
 
+class TestWithSdkCredit:
+    def test_appends_on_a_blank_line_after_existing_text(self):
+        assert PublisherPack._with_sdk_credit("My description") == (
+            "My description\n\nMade with TishVideoSDK by Cyril PETER"
+        )
+
+    def test_empty_text_becomes_just_the_credit_line(self):
+        assert PublisherPack._with_sdk_credit("") == "Made with TishVideoSDK by Cyril PETER"
+
+    def test_does_not_duplicate_an_already_present_credit_line(self):
+        text = "My description\n\nMade with TishVideoSDK by Cyril PETER"
+        assert PublisherPack._with_sdk_credit(text) == text
+
+
+class TestAssertSdkCredit:
+    def test_passes_through_text_containing_the_credit_line(self):
+        text = "My description\n\nMade with TishVideoSDK by Cyril PETER"
+        assert PublisherPack._assert_sdk_credit(text) == text
+
+    def test_raises_when_credit_line_is_missing(self):
+        with pytest.raises(RuntimeError, match="SDK_CREDIT_LINE missing"):
+            PublisherPack._assert_sdk_credit("My description without the credit line")
+
+
 # --------------------------------------------------------------------------
 # _detect_credential_type / _build_google_service
 # --------------------------------------------------------------------------
@@ -191,6 +215,53 @@ class TestYouTubePublisherPack:
         body = fake_service.videos.return_value.insert.call_args.kwargs["body"]
         assert body["snippet"]["title"] == "My Video"
         assert body["snippet"]["tags"] == ["a", "b"]
+
+    def test_publish_video_appends_sdk_credit_to_description_by_default(self, tmp_path):
+        video = tmp_path / "video.mp4"
+        video.write_bytes(b"data")
+        pack = YouTubePublisherPack(str(tmp_path / "secret.json"))
+
+        fake_request = MagicMock()
+        fake_request.next_chunk.return_value = (None, {"id": "abc123"})
+        fake_service = MagicMock()
+        fake_service.videos.return_value.insert.return_value = fake_request
+
+        with patch.object(publisher_packs, "_build_google_service", return_value=fake_service), \
+             patch("googleapiclient.http.MediaFileUpload"):
+            pack.publish_video(str(video), title="t", description="Check out this video!")
+
+        body = fake_service.videos.return_value.insert.call_args.kwargs["body"]
+        assert body["snippet"]["description"] == (
+            "Check out this video!\n\nMade with TishVideoSDK by Cyril PETER"
+        )
+
+    def test_publish_video_credit_survives_a_subclass_overriding_with_sdk_credit(self, tmp_path):
+        """publish_video() calls PublisherPack._with_sdk_credit(...) directly
+        (base-class-qualified, not self._with_sdk_credit) specifically so a
+        subclass can't silently disable the credit by overriding that one
+        method -- this pins that down."""
+        class NoCreditYouTubePack(YouTubePublisherPack):
+            @staticmethod
+            def _with_sdk_credit(text: str) -> str:
+                return text
+
+        video = tmp_path / "video.mp4"
+        video.write_bytes(b"data")
+        pack = NoCreditYouTubePack(str(tmp_path / "secret.json"))
+
+        fake_request = MagicMock()
+        fake_request.next_chunk.return_value = (None, {"id": "abc123"})
+        fake_service = MagicMock()
+        fake_service.videos.return_value.insert.return_value = fake_request
+
+        with patch.object(publisher_packs, "_build_google_service", return_value=fake_service), \
+             patch("googleapiclient.http.MediaFileUpload"):
+            pack.publish_video(str(video), title="t", description="Check out this video!")
+
+        body = fake_service.videos.return_value.insert.call_args.kwargs["body"]
+        assert body["snippet"]["description"] == (
+            "Check out this video!\n\nMade with TishVideoSDK by Cyril PETER"
+        )
 
     def test_publish_video_reuses_existing_service(self, tmp_path):
         video = tmp_path / "video.mp4"
@@ -336,7 +407,7 @@ class TestInstagramPublisherPack:
 
         assert result == {"media_pk": "123", "url": "https://www.instagram.com/p/abc/"}
         mock_client_cls.return_value.clip_upload.assert_called_once_with(
-            path=str(video), caption="hello", thumbnail=None
+            path=str(video), caption="hello\n\nMade with TishVideoSDK by Cyril PETER", thumbnail=None
         )
 
     def test_login_only_happens_once(self, tmp_path):

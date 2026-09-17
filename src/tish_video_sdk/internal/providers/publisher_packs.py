@@ -31,6 +31,8 @@ import httplib2
 
 from ...date_managment import compute_publish_datetime
 
+SDK_CREDIT_LINE = "Made with TishVideoSDK by Cyril PETER"
+
 
 class PublisherPack(ABC):
     """Abstract base for a single publishing platform's adapter."""
@@ -49,6 +51,39 @@ class PublisherPack(ABC):
         response as a dict on success, or None on failure (missing/invalid
         credentials, network error, upload rejected) -- callers should treat
         a None return as "did not publish", not as a raised error."""
+
+    @staticmethod
+    def _with_sdk_credit(text: str) -> str:
+        """Append SDK_CREDIT_LINE to text (a YouTube description or
+        Instagram caption) on a blank line, unless it's already present
+        (e.g. a caller composing it manually, or a retried publish_video()
+        call). Every publish_video() implementation calls this via
+        PublisherPack._with_sdk_credit(...) (the base class, not self./cls.)
+        immediately before building its request body, and _assert_sdk_credit
+        re-checks the result right before the network call -- two
+        independent, class-qualified checkpoints so a subclass overriding
+        _with_sdk_credit (or publish_video patching the instance method)
+        can't quietly drop the credit without also having to defeat the
+        final assertion."""
+        if SDK_CREDIT_LINE in text:
+            return text
+        return f"{text}\n\n{SDK_CREDIT_LINE}" if text else SDK_CREDIT_LINE
+
+    @staticmethod
+    def _assert_sdk_credit(text: str) -> str:
+        """Final gate run immediately before the network call in every
+        publish_video() implementation, after _with_sdk_credit. Not a retry
+        or a fix-up -- if SDK_CREDIT_LINE is missing here it means something
+        upstream (a subclass override, a monkeypatch, a future edit that
+        forgot to call _with_sdk_credit) bypassed it, and that's a bug to
+        surface loudly rather than silently publish without credit."""
+        if SDK_CREDIT_LINE not in text:
+            raise RuntimeError(
+                "SDK_CREDIT_LINE missing from the text about to be published. "
+                "This credit is compulsory -- publish_video() must not be called "
+                "in a way that strips it."
+            )
+        return text
 
     @classmethod
     def get(cls, provider: str, **init_kwargs) -> "PublisherPack":
@@ -223,7 +258,8 @@ class YouTubePublisherPack(PublisherPack):
                        utc_offset_hours: int = 0,
                        privacy_status: str = "public", notify_subscribers: bool = True,
                        made_for_kids: bool = False, category_id: Optional[int] = None,
-                       language_code: Optional[str] = None, **kwargs) -> Optional[dict]:
+                       language_code: Optional[str] = None,
+                       **kwargs) -> Optional[dict]:
         """Resumable upload via the YouTube Data API. Scheduling (publish_at)
         applies if publish_year/month/day/hour are all given, or -- as a
         higher-level alternative -- if content_date and hour_of_day are both
@@ -231,7 +267,11 @@ class YouTubePublisherPack(PublisherPack):
         utc_offset_hours is added to hour_of_day); computed via
         date_managment.compute_publish_datetime. publish_year/month/day/hour
         takes precedence if both forms are given. Otherwise the video
-        publishes per privacy_status immediately."""
+        publishes per privacy_status immediately.
+
+        description always gets SDK_CREDIT_LINE appended (see
+        PublisherPack._with_sdk_credit) -- this is compulsory and cannot be
+        disabled."""
         from googleapiclient.http import MediaFileUpload
 
         if not os.path.exists(video_filepath):
@@ -239,6 +279,8 @@ class YouTubePublisherPack(PublisherPack):
             return None
         if not self._ensure_service():
             return None
+
+        description = PublisherPack._with_sdk_credit(description)
 
         publish_at_iso = None
         if None not in (publish_year, publish_month, publish_day, publish_hour):
@@ -251,7 +293,7 @@ class YouTubePublisherPack(PublisherPack):
             )
 
         request_body = self._build_request_body(
-            title, description, tags or [], publish_at_iso, privacy_status,
+            title, PublisherPack._assert_sdk_credit(description), tags or [], publish_at_iso, privacy_status,
             notify_subscribers, made_for_kids, category_id, language_code,
         )
         media_file = MediaFileUpload(video_filepath, mimetype="video/*", resumable=True, chunksize=4 * 1024 * 1024)
@@ -488,13 +530,19 @@ class InstagramPublisherPack(PublisherPack):
 
     def publish_video(self, video_filepath: str, caption: str = "", thumbnail_filepath: Optional[str] = None,
                        **kwargs) -> Optional[dict]:
+        """caption always gets SDK_CREDIT_LINE appended (see
+        PublisherPack._with_sdk_credit) -- this is compulsory and cannot be
+        disabled."""
         if not os.path.exists(video_filepath):
             print(f"Error: video file '{video_filepath}' not found.")
             return None
         if not self._ensure_login():
             return None
+        caption = PublisherPack._with_sdk_credit(caption)
         try:
-            media = self._client.clip_upload(path=video_filepath, caption=caption, thumbnail=thumbnail_filepath)
+            media = self._client.clip_upload(
+                path=video_filepath, caption=PublisherPack._assert_sdk_credit(caption), thumbnail=thumbnail_filepath
+            )
         except Exception as e:
             print(f"Error during Instagram upload: {e}")
             return None

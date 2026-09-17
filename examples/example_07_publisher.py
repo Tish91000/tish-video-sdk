@@ -25,7 +25,10 @@ Demonstrates:
 - Every publish_video()/publish_to_youtube()/publish_to_instagram() call
   appends publisher_packs.SDK_CREDIT_LINE ("Made with TishVideoSDK by Cyril
   PETER") to the description/caption unconditionally -- this credit is
-  compulsory and cannot be disabled.
+  compulsory and cannot be disabled. Passing background_music_filepath (the
+  path MusicManager.add_background_music returned -- see
+  ../examples/example_05_music.py) appends that track's Jamendo/CC
+  attribution credit too, equally automatically and equally compulsory.
 """
 import os
 
@@ -77,6 +80,10 @@ def main():
     #         # Schedule from a content date instead of spelling out
     #         # publish_year/month/day/hour by hand:
     #         content_date=next_date, hour_of_day=21, utc_offset_hours=-2,
+    #         # The path MusicManager.add_background_music returned, if this
+    #         # video used one -- Publisher appends its Jamendo/CC credit
+    #         # automatically:
+    #         background_music_filepath=bgm_path,
     #     )
     # if publisher.instagram:
     #     publisher.publish_to_instagram("video.mp4", caption="My caption")

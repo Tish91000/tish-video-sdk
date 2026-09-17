@@ -85,6 +85,49 @@ class PublisherPack(ABC):
             )
         return text
 
+    @staticmethod
+    def _with_music_credit(text: str, background_music_filepath: Optional[str]) -> str:
+        """Append background_music_filepath's recorded Jamendo/CC attribution
+        credit (see MusicManager.get_attribution_text) to text, on a blank
+        line, if background_music_filepath was given and its track actually
+        carries one (locally-supplied bgm has none -- nothing to add).
+        Deferred import: avoids pulling in music.py's deps (pydub, the
+        reasoning pack) for callers who never pass background_music_filepath.
+        There is no parameter to suppress this once a filepath is given --
+        mirrors _with_sdk_credit's no-opt-out shape, and _assert_music_credit
+        is the matching final checkpoint."""
+        if not background_music_filepath:
+            return text
+        from ...music import MusicManager
+
+        credit = MusicManager.get_attribution_text(background_music_filepath)
+        if not credit or credit in text:
+            return text
+        return f"{text}\n\n{credit}" if text else credit
+
+    @staticmethod
+    def _assert_music_credit(text: str, background_music_filepath: Optional[str]) -> str:
+        """Final gate mirroring _assert_sdk_credit, run immediately before
+        the network call: if background_music_filepath was given and its
+        track carries recorded attribution, that exact credit must already
+        be present in text. Re-derives the expected credit itself rather
+        than trusting a flag, so it catches the same failure modes
+        _assert_sdk_credit does -- a subclass override, a monkeypatch, a
+        future edit that forgot to call _with_music_credit."""
+        if not background_music_filepath:
+            return text
+        from ...music import MusicManager
+
+        credit = MusicManager.get_attribution_text(background_music_filepath)
+        if credit and credit not in text:
+            raise RuntimeError(
+                f"Required music attribution credit missing from the text about to be "
+                f"published: {credit!r}. This credit is compulsory once "
+                "background_music_filepath is given -- publish_video() must not be "
+                "called in a way that strips it."
+            )
+        return text
+
     @classmethod
     def get(cls, provider: str, **init_kwargs) -> "PublisherPack":
         """Instantiate the PublisherPack registered for provider (e.g.
@@ -258,7 +301,7 @@ class YouTubePublisherPack(PublisherPack):
                        utc_offset_hours: int = 0,
                        privacy_status: str = "public", notify_subscribers: bool = True,
                        made_for_kids: bool = False, category_id: Optional[int] = None,
-                       language_code: Optional[str] = None,
+                       language_code: Optional[str] = None, background_music_filepath: Optional[str] = None,
                        **kwargs) -> Optional[dict]:
         """Resumable upload via the YouTube Data API. Scheduling (publish_at)
         applies if publish_year/month/day/hour are all given, or -- as a
@@ -271,7 +314,11 @@ class YouTubePublisherPack(PublisherPack):
 
         description always gets SDK_CREDIT_LINE appended (see
         PublisherPack._with_sdk_credit) -- this is compulsory and cannot be
-        disabled."""
+        disabled. Pass background_music_filepath (the bgm file path
+        MusicManager.add_background_music mixed into the video's audio) to
+        also append that track's Jamendo/CC attribution credit
+        automatically -- equally compulsory once given, see
+        PublisherPack._with_music_credit."""
         from googleapiclient.http import MediaFileUpload
 
         if not os.path.exists(video_filepath):
@@ -281,6 +328,7 @@ class YouTubePublisherPack(PublisherPack):
             return None
 
         description = PublisherPack._with_sdk_credit(description)
+        description = PublisherPack._with_music_credit(description, background_music_filepath)
 
         publish_at_iso = None
         if None not in (publish_year, publish_month, publish_day, publish_hour):
@@ -292,8 +340,10 @@ class YouTubePublisherPack(PublisherPack):
                 scheduled_dt.year, scheduled_dt.month, scheduled_dt.day, scheduled_dt.hour, scheduled_dt.minute
             )
 
+        description = PublisherPack._assert_sdk_credit(description)
+        description = PublisherPack._assert_music_credit(description, background_music_filepath)
         request_body = self._build_request_body(
-            title, PublisherPack._assert_sdk_credit(description), tags or [], publish_at_iso, privacy_status,
+            title, description, tags or [], publish_at_iso, privacy_status,
             notify_subscribers, made_for_kids, category_id, language_code,
         )
         media_file = MediaFileUpload(video_filepath, mimetype="video/*", resumable=True, chunksize=4 * 1024 * 1024)
@@ -529,20 +579,24 @@ class InstagramPublisherPack(PublisherPack):
         return True
 
     def publish_video(self, video_filepath: str, caption: str = "", thumbnail_filepath: Optional[str] = None,
-                       **kwargs) -> Optional[dict]:
+                       background_music_filepath: Optional[str] = None, **kwargs) -> Optional[dict]:
         """caption always gets SDK_CREDIT_LINE appended (see
         PublisherPack._with_sdk_credit) -- this is compulsory and cannot be
-        disabled."""
+        disabled. Pass background_music_filepath (the bgm file path
+        MusicManager.add_background_music mixed into the video's audio) to
+        also append that track's Jamendo/CC attribution credit automatically
+        -- equally compulsory once given, see PublisherPack._with_music_credit."""
         if not os.path.exists(video_filepath):
             print(f"Error: video file '{video_filepath}' not found.")
             return None
         if not self._ensure_login():
             return None
         caption = PublisherPack._with_sdk_credit(caption)
+        caption = PublisherPack._with_music_credit(caption, background_music_filepath)
+        caption = PublisherPack._assert_sdk_credit(caption)
+        caption = PublisherPack._assert_music_credit(caption, background_music_filepath)
         try:
-            media = self._client.clip_upload(
-                path=video_filepath, caption=PublisherPack._assert_sdk_credit(caption), thumbnail=thumbnail_filepath
-            )
+            media = self._client.clip_upload(path=video_filepath, caption=caption, thumbnail=thumbnail_filepath)
         except Exception as e:
             print(f"Error during Instagram upload: {e}")
             return None

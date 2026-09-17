@@ -15,6 +15,11 @@ Demonstrates five flows:
   other examples' provider checks.
 - Jamendo fallback: mixing for "meditative", a mood with no local placeholder
   track, gated on JAMENDO_CLIENT_ID being configured -- skipped otherwise.
+  Also shows add_background_music's return value: the background music file
+  path it actually used, ready to pass to Publisher.publish_to_youtube's/
+  publish_to_instagram's background_music_filepath so the Creative Commons
+  attribution a Jamendo track requires reaches the published video
+  automatically, without building or forwarding any credit text by hand.
 - Gemini + Jamendo combined: reference_text_for_mood describing a scene with
   no local placeholder mood, gated on both REASONING_PACKS_PATH and
   JAMENDO_CLIENT_ID. Gemini classifies the mood *and* -- since the reference
@@ -133,11 +138,14 @@ def main():
 
     print("--- Jamendo fallback (mood with no local track) ---")
     if manager.jamendo_client_id:
-        manager.add_background_music(
+        bgm_path = manager.add_background_music(
             speech_path,
             os.path.join(output_dir, "speech_with_jamendo_bgm.wav"),
             music_input="meditative",  # no local placeholder generated for this mood
         )
+        music_credit = MusicManager.get_attribution_text(bgm_path)
+        if music_credit:
+            print(f"Music credit (Publisher appends this automatically given background_music_filepath={bgm_path!r}): {music_credit}")
     else:
         print("No JAMENDO_CLIENT_ID configured; skipping Jamendo fallback.")
 

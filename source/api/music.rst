@@ -34,7 +34,17 @@ searches differently instead of always resolving to the same single tag.
 Whatever gets found is filed under the mood's own local folder regardless of
 what query found it. A downloaded track's credit/license info is recorded in
 a ``<file>.cache.json`` sidecar next to it (shared with the loudness-analysis
-cache).
+cache), and :meth:`MusicManager.get_attribution_text` turns that sidecar
+entry into a ready-to-publish credit line (``None`` for a track with no
+recorded attribution, e.g. a locally-supplied file). :meth:`MusicManager.add_background_music`
+returns the background music file path it actually mixed in -- pass that
+straight through as :meth:`Publisher.publish_to_youtube
+<tish_video_sdk.publisher.Publisher.publish_to_youtube>`/:meth:`publish_to_instagram
+<tish_video_sdk.publisher.Publisher.publish_to_instagram>`'s
+``background_music_filepath`` and, if the track carries recorded Jamendo
+attribution, Publisher looks it up and appends the required Creative Commons
+credit to the published video automatically, alongside the SDK's own credit
+line those calls add by default.
 
 Jamendo isn't only an automatic fallback: :meth:`MusicManager.fetch_from_jamendo`
 exposes it as an explicit action too, searching and downloading regardless of
@@ -59,8 +69,11 @@ Usage
 
    manager = MusicManager(bgm_directory="./music/bgm", gemini_api_key="...")
 
-   # Mix a specific mood under a narration file:
-   manager.add_background_music(
+   # Mix a specific mood under a narration file. Returns the background
+   # music file path it actually used -- feed this to Publisher later (see
+   # publisher.rst) so a Jamendo track's required credit is appended
+   # automatically at publish time:
+   bgm_path = manager.add_background_music(
        "narration.wav", "narration_with_music.wav", music_input="calm"
    )
 

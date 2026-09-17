@@ -40,7 +40,7 @@ video.save("output.mp4")
 from tish_video_sdk.music import MusicManager
 
 manager = MusicManager(bgm_directory="./music/bgm")
-manager.add_background_music("narration.wav", "narration_with_music.wav", music_input="calm")
+bgm_path = manager.add_background_music("narration.wav", "narration_with_music.wav", music_input="calm")
 ```
 
 ```python
@@ -54,13 +54,16 @@ paths = generator.search_or_generate("a quiet mountain sunrise", output_name="su
 from tish_video_sdk.publisher import Publisher
 
 publisher = Publisher(youtube_client_secret_filepath="client_secret.json")
-publisher.publish_to_youtube("output.mp4", title="My Video", description="...", tags=["tag1"])
+publisher.publish_to_youtube(
+    "output.mp4", title="My Video", description="...", tags=["tag1"],
+    background_music_filepath=bgm_path,
+)
 # description becomes "...\n\nMade with TishVideoSDK by Cyril PETER" -- every
 # publish_video()/publish_to_youtube()/publish_to_instagram() call appends
-# this credit line unconditionally; it cannot be disabled.
-# A Jamendo-sourced background track (see add_background_music's return
-# value) similarly gets its own required credit line appended when you pass
-# it through as extra description/caption text.
+# this credit line unconditionally; it cannot be disabled. Passing
+# background_music_filepath (bgm_path above) also appends that track's
+# Jamendo/CC attribution credit automatically, just as unconditionally, if
+# it carries one.
 ```
 
 See the full API reference under `source/api/`.

@@ -14,11 +14,27 @@ import pytest
 
 from tish_video_sdk import date_managment
 from tish_video_sdk import publisher as publisher_module
+from tish_video_sdk.music import MusicManager
 from tish_video_sdk.publisher import Publisher
 from tish_video_sdk.internal.providers import publisher_packs
 from tish_video_sdk.internal.providers.publisher_packs import (
     InstagramPublisherPack, PublisherPack, YouTubePublisherPack, _build_google_service, _detect_credential_type,
 )
+
+
+def _write_fake_attribution(file_path, name="Sample Track", artist="Some Artist",
+                             license_ccurl="https://creativecommons.org/licenses/by/4.0/"):
+    """Writes file_path's sidecar cache with recorded Jamendo attribution,
+    the same shape MusicManager._write_attribution produces -- lets a test
+    exercise get_attribution_text()-backed behavior without a real Jamendo
+    download. file_path itself never needs to exist; the sidecar lives at
+    file_path + '.cache.json'."""
+    MusicManager._write_sidecar(file_path, {
+        "attribution": {
+            "source": "jamendo", "track_id": "123", "name": name,
+            "artist_name": artist, "license_ccurl": license_ccurl,
+        },
+    })
 
 
 class _FixedNow(datetime):
@@ -78,6 +94,56 @@ class TestAssertSdkCredit:
     def test_raises_when_credit_line_is_missing(self):
         with pytest.raises(RuntimeError, match="SDK_CREDIT_LINE missing"):
             PublisherPack._assert_sdk_credit("My description without the credit line")
+
+
+class TestWithMusicCredit:
+    def test_appends_attributed_track_credit(self, tmp_path):
+        bgm_path = str(tmp_path / "jamendo_track.mp3")
+        _write_fake_attribution(bgm_path)
+        assert PublisherPack._with_music_credit("My description", bgm_path) == (
+            'My description\n\nMusic: "Sample Track" by Some Artist (via Jamendo), '
+            "licensed under https://creativecommons.org/licenses/by/4.0/"
+        )
+
+    def test_no_filepath_leaves_text_untouched(self):
+        assert PublisherPack._with_music_credit("My description", None) == "My description"
+
+    def test_filepath_with_no_recorded_attribution_leaves_text_untouched(self, tmp_path):
+        local_bgm = str(tmp_path / "local_track.wav")
+        assert PublisherPack._with_music_credit("My description", local_bgm) == "My description"
+
+    def test_does_not_duplicate_an_already_present_credit_line(self, tmp_path):
+        bgm_path = str(tmp_path / "jamendo_track.mp3")
+        _write_fake_attribution(bgm_path)
+        text = (
+            'My description\n\nMusic: "Sample Track" by Some Artist (via Jamendo), '
+            "licensed under https://creativecommons.org/licenses/by/4.0/"
+        )
+        assert PublisherPack._with_music_credit(text, bgm_path) == text
+
+
+class TestAssertMusicCredit:
+    def test_no_filepath_passes_through(self):
+        assert PublisherPack._assert_music_credit("My description", None) == "My description"
+
+    def test_filepath_with_no_attribution_passes_through(self, tmp_path):
+        local_bgm = str(tmp_path / "local_track.wav")
+        assert PublisherPack._assert_music_credit("My description", local_bgm) == "My description"
+
+    def test_passes_through_text_containing_the_credit(self, tmp_path):
+        bgm_path = str(tmp_path / "jamendo_track.mp3")
+        _write_fake_attribution(bgm_path)
+        text = (
+            'My description\n\nMusic: "Sample Track" by Some Artist (via Jamendo), '
+            "licensed under https://creativecommons.org/licenses/by/4.0/"
+        )
+        assert PublisherPack._assert_music_credit(text, bgm_path) == text
+
+    def test_raises_when_required_credit_is_missing(self, tmp_path):
+        bgm_path = str(tmp_path / "jamendo_track.mp3")
+        _write_fake_attribution(bgm_path)
+        with pytest.raises(RuntimeError, match="Required music attribution credit missing"):
+            PublisherPack._assert_music_credit("My description without the credit", bgm_path)
 
 
 # --------------------------------------------------------------------------
@@ -233,6 +299,32 @@ class TestYouTubePublisherPack:
         body = fake_service.videos.return_value.insert.call_args.kwargs["body"]
         assert body["snippet"]["description"] == (
             "Check out this video!\n\nMade with TishVideoSDK by Cyril PETER"
+        )
+
+    def test_publish_video_appends_music_credit_when_background_music_filepath_given(self, tmp_path):
+        video = tmp_path / "video.mp4"
+        video.write_bytes(b"data")
+        bgm_path = str(tmp_path / "jamendo_track.mp3")
+        _write_fake_attribution(bgm_path)
+        pack = YouTubePublisherPack(str(tmp_path / "secret.json"))
+
+        fake_request = MagicMock()
+        fake_request.next_chunk.return_value = (None, {"id": "abc123"})
+        fake_service = MagicMock()
+        fake_service.videos.return_value.insert.return_value = fake_request
+
+        with patch.object(publisher_packs, "_build_google_service", return_value=fake_service), \
+             patch("googleapiclient.http.MediaFileUpload"):
+            pack.publish_video(
+                str(video), title="t", description="Check out this video!",
+                background_music_filepath=bgm_path,
+            )
+
+        body = fake_service.videos.return_value.insert.call_args.kwargs["body"]
+        assert body["snippet"]["description"] == (
+            "Check out this video!\n\nMade with TishVideoSDK by Cyril PETER"
+            '\n\nMusic: "Sample Track" by Some Artist (via Jamendo), '
+            "licensed under https://creativecommons.org/licenses/by/4.0/"
         )
 
     def test_publish_video_credit_survives_a_subclass_overriding_with_sdk_credit(self, tmp_path):
@@ -408,6 +500,28 @@ class TestInstagramPublisherPack:
         assert result == {"media_pk": "123", "url": "https://www.instagram.com/p/abc/"}
         mock_client_cls.return_value.clip_upload.assert_called_once_with(
             path=str(video), caption="hello\n\nMade with TishVideoSDK by Cyril PETER", thumbnail=None
+        )
+
+    def test_publish_video_appends_music_credit_when_background_music_filepath_given(self, tmp_path):
+        video = tmp_path / "video.mp4"
+        video.write_bytes(b"data")
+        bgm_path = str(tmp_path / "jamendo_track.mp3")
+        _write_fake_attribution(bgm_path)
+        fake_media = MagicMock(pk="123", code="abc")
+
+        with patch("instagrapi.Client") as mock_client_cls:
+            mock_client_cls.return_value.clip_upload.return_value = fake_media
+            pack = InstagramPublisherPack("user", "pass")
+            pack.publish_video(str(video), caption="hello", background_music_filepath=bgm_path)
+
+        mock_client_cls.return_value.clip_upload.assert_called_once_with(
+            path=str(video),
+            caption=(
+                "hello\n\nMade with TishVideoSDK by Cyril PETER"
+                '\n\nMusic: "Sample Track" by Some Artist (via Jamendo), '
+                "licensed under https://creativecommons.org/licenses/by/4.0/"
+            ),
+            thumbnail=None,
         )
 
     def test_login_only_happens_once(self, tmp_path):

@@ -268,6 +268,42 @@ class TestJamendoFallback:
         assert cache["attribution"]["name"] == "Sample Track"
         assert isinstance(cache["dbfs"], float)
 
+    def test_get_attribution_text_formats_recorded_credit(self, tmp_path):
+        manager = MusicManager(bgm_directory=str(tmp_path / "bgm"), jamendo_client_id="fake-client-id")
+
+        with patch("tish_video_sdk.music.music_packs.search_track",
+                   return_value=_fake_track(name="Sample Track", artist="Some Artist")), \
+             patch("tish_video_sdk.music.music_packs.download_track", side_effect=_fake_download_track):
+            result = manager.select_audio_music("calm", duration=2)
+
+        credit = MusicManager.get_attribution_text(result)
+        assert credit == (
+            'Music: "Sample Track" by Some Artist (via Jamendo), '
+            "licensed under https://creativecommons.org/licenses/by/4.0/"
+        )
+
+    def test_get_attribution_text_none_for_untracked_file(self, tmp_path):
+        local_file = tmp_path / "bgm" / "calm" / "my_track.wav"
+        local_file.parent.mkdir(parents=True)
+        _write_tone(local_file, 500)
+        assert MusicManager.get_attribution_text(str(local_file)) is None
+
+    def test_add_background_music_returns_the_bgm_filepath_used(self, tmp_path):
+        speech_file = tmp_path / "speech.wav"
+        _write_tone(speech_file, 3000)
+        manager = MusicManager(bgm_directory=str(tmp_path / "bgm"), jamendo_client_id="fake-client-id")
+
+        with patch("tish_video_sdk.music.music_packs.search_track",
+                   return_value=_fake_track(name="Sample Track", artist="Some Artist")), \
+             patch("tish_video_sdk.music.music_packs.download_track", side_effect=_fake_download_track):
+            bgm_path = manager.add_background_music(str(speech_file), str(tmp_path / "out.wav"), music_input="calm")
+
+        assert bgm_path == str(tmp_path / "bgm" / "calm" / "jamendo_123_Sample_Track.mp3")
+        assert MusicManager.get_attribution_text(bgm_path) == (
+            'Music: "Sample Track" by Some Artist (via Jamendo), '
+            "licensed under https://creativecommons.org/licenses/by/4.0/"
+        )
+
     def test_long_reference_text_is_condensed_via_gemini_before_reaching_jamendo(self, tmp_path):
         long_text = (
             "On the seashore of endless worlds children meet, the infinite sky is "

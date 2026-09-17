@@ -519,6 +519,27 @@ class MusicManager:
         except Exception:
             pass  # best-effort -- a read-only bgm directory shouldn't break mixing
 
+    @classmethod
+    def get_attribution_text(cls, file_path: str) -> Optional[str]:
+        """Ready-to-publish credit line for file_path, built from the
+        attribution _write_attribution recorded in its sidecar cache at
+        download time. None for a track with no recorded attribution (any
+        locally-supplied bgm file, or one predating this SDK version) --
+        there's nothing to require credit for. Meant to be appended to a
+        video's YouTube description/Instagram caption alongside
+        publisher_packs.SDK_CREDIT_LINE, since CC licenses commonly require
+        attribution wherever the video is published, not just in a local file."""
+        attribution = cls._read_sidecar(file_path).get("attribution")
+        if not attribution:
+            return None
+        name = attribution.get("name", "")
+        artist_name = attribution.get("artist_name", "")
+        credit = f"Music: \"{name}\" by {artist_name} (via Jamendo)"
+        license_ccurl = attribution.get("license_ccurl")
+        if license_ccurl:
+            credit += f", licensed under {license_ccurl}"
+        return credit
+
     def get_music_path(self,
                         music_input: Union[str, None] = None,
                         reference_text: str = "",
@@ -566,7 +587,7 @@ class MusicManager:
                               output_audio_filepath: str,
                               background_music_volume_reduction_db: float = 10.0,
                               music_input: Union[str, None] = None,
-                              reference_text_for_mood: str = "") -> None:
+                              reference_text_for_mood: str = "") -> str:
         """
         Overlays background music onto a speech audio file and saves the combined audio.
 
@@ -579,6 +600,17 @@ class MusicManager:
                 normalized to sit this far under the speech).
             music_input: Music file path, mood name, or None for auto-selection.
             reference_text_for_mood: Reference text to determine mood if needed.
+
+        Returns:
+            The background music file path actually used (resolved via
+            get_music_path -- the exact file mixed in, whichever of
+            music_input/reference_text_for_mood/default_mood chose it). Pass
+            this straight to Publisher.publish_to_youtube's/
+            publish_to_instagram's background_music_filepath -- if the track
+            carries recorded Jamendo attribution (see get_attribution_text),
+            Publisher looks it up from this same path and appends the
+            required credit to the published video automatically, without
+            the caller building or forwarding credit text itself.
         """
         print(f"Attempting to add background music to '{speech_audio_filepath}'...")
 
@@ -641,6 +673,8 @@ class MusicManager:
             print(f"Final mixed audio successfully saved to: '{output_audio_filepath}'")
         except Exception as e:
             raise Exception(f"Error exporting mixed audio to '{output_audio_filepath}': {e}")
+
+        return background_music_filepath
 
     def get_audio_with_bgm_from_mood(self,
                                       speech_audio_filepath: str,

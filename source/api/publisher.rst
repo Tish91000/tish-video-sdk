@@ -33,12 +33,13 @@ wrapper -- appends
 :data:`~tish_video_sdk.internal.providers.publisher_packs.SDK_CREDIT_LINE`
 ("Made with TishVideoSDK by Cyril PETER") to the description/caption
 unconditionally; this credit is compulsory and there is no way to opt out
-of it for a given call. A Jamendo-sourced background track's own required
-attribution (see
-:meth:`~tish_video_sdk.music.MusicManager.get_attribution_text`) is a
-separate credit line -- pass it through as extra description/caption text
-alongside the SDK credit, it is not added automatically here since
-:class:`Publisher` has no visibility into which track a video used.
+of it for a given call. Pass ``background_music_filepath`` (the bgm file
+path :meth:`~tish_video_sdk.music.MusicManager.add_background_music` mixed
+into the video's audio) and its Jamendo/CC attribution credit (see
+:meth:`~tish_video_sdk.music.MusicManager.get_attribution_text`) gets
+appended too, equally automatically and equally unable to be disabled --
+:class:`Publisher` has no visibility into which track a video used on its
+own, so this is the one piece of information you still have to hand it.
 
 YouTube alone has operations with no Instagram equivalent -- comments,
 thumbnails, channel video listing, trending videos. Those live on
@@ -98,9 +99,11 @@ Usage
    publisher.publish_to_youtube(
        "video.mp4", title="My Video", description="...", tags=["tag1", "tag2"],
        content_date=content_date, hour_of_day=21, utc_offset_hours=-2,
+       background_music_filepath="music/bgm/calm/jamendo_track.mp3",  # optional
    )
-   # description becomes "...\n\nMade with TishVideoSDK by Cyril PETER" --
-   # this credit line is appended unconditionally and cannot be disabled.
+   # description becomes "...\n\nMade with TishVideoSDK by Cyril PETER\n\n
+   # Music: ..." -- both credit lines are appended unconditionally and
+   # cannot be disabled.
    publisher.publish_to_instagram("video.mp4", caption="My caption")
 
    publisher.mark_published(content_date)  # once the caller decides this date is settled

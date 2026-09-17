@@ -4,6 +4,7 @@ import os
 
 from moviepy import (
     VideoFileClip,
+    VideoClip,
     AudioFileClip,
     ImageClip,
     ColorClip,
@@ -18,6 +19,7 @@ from dataclasses import dataclass
 from PIL import Image, ImageColor, ImageDraw, ImageFilter, ImageFont
 import uuid # For unique temp filenames
 import traceback # Debugging
+import bisect # Locating the active boundary interval in _overlay_scrolling_lyrics_on_single_clip
 
 # Simple Dummy Logger to fix MoviePy/proglog 'NoneType' stdout errors
 class DummyLogger:
@@ -44,6 +46,22 @@ from typing import Optional, List, Dict, Tuple, Union
 import tempfile
 
 DEFAULT_FPS = 24 # Frames per second for the output video
+
+# Below this duration, VideoBuilder.save() always uses the single-process
+# write_videofile() path -- the fixed cost of spawning worker processes and
+# re-running build() once per worker isn't worth it for short clips.
+PARALLEL_RENDER_MIN_DURATION_S = 30.0
+
+# Chunked parallel rendering never splits a clip into pieces smaller than
+# this -- caps how many workers save() spawns for a given duration.
+MIN_CHUNK_DURATION_S = 20.0
+
+# Conservative per-worker memory budget for chunked parallel rendering:
+# each worker is a full process re-importing the SDK/moviepy/numpy/PIL,
+# holding the base image/audio, and compositing overlay images plus the
+# lyrics overlay frame-by-frame. Used to cap worker count against actually
+# -available memory, not just CPU count.
+PARALLEL_RENDER_MEM_PER_WORKER_BYTES = 2 * 1024 ** 3  # 2 GiB
 
 # Font mapping for common families, resolved against the Windows Fonts folder.
 DEFAULT_FONT_SIZE = 50
@@ -708,6 +726,173 @@ class VideoBuilder:
         print(f"Final video clip - Duration: {final_duration_str}s, FPS: {getattr(self.video_clip, 'fps', 'unknown')}")
         return self.video_clip
 
+    def _capture_rebuild_state(self) -> Optional[Dict]:
+        """Plain-data snapshot of this builder's *resolved* pre-build inputs,
+        picklable across a process boundary so a worker (see
+        _render_video_chunk) can reconstruct an equivalent VideoBuilder and
+        call build() itself.
+
+        The built self.video_clip can't cross a Windows `spawn` process
+        boundary: MoviePy's own VideoClip.__init__ closes over an
+        unpicklable lambda, and swapping in a closure-capable pickler
+        (dill/`multiprocess`) instead corrupted the ffmpeg audio reader's OS
+        handle in testing. Rebuilding from plain data sidesteps both
+        failure modes.
+
+        Returns None for construction paths this doesn't support:
+        from_multi_segments_advanced's per-segment TTS/caching makes a
+        chunked re-build unsafe (it would redo external TTS calls, possibly
+        non-deterministically, once per worker), and there's nothing to
+        rebuild from if neither a single image nor image segments were ever
+        configured.
+        """
+        if self._advanced_segments:
+            return None
+        if not self._image_filepath and not self._image_segments:
+            return None
+        return {
+            'fps': self.fps,
+            'width': self.width,
+            'height': self.height,
+            'image_filepath': self._image_filepath,
+            'image_segments': self._image_segments,
+            'audio_filepath': self._audio_filepath,
+            'text_segments': self._text_segments,
+            'text_style': self._text_style,
+            'overlay_images': self._overlay_images,
+            'overlay_video_path': self._overlay_video_path,
+            'overlay_video_config': self._overlay_video_config,
+        }
+
+    def _save_parallel(self, output_filepath: str) -> Optional[str]:
+        """Chunked multiprocess render for long clips: split [0, duration)
+        into (cpu_count - 1) pieces, render each piece's frames in its own
+        process -- working around the fact that a single process's
+        Python-side frame compositing, not FFmpeg encoding, is what
+        actually bottlenecks a long karaoke-style render (profiled at ~99%
+        of one core in Python vs ~17% of one core in ffmpeg) -- then
+        concatenate the silent chunks and mux the original full audio back
+        in once.
+
+        Safe only because every per-frame effect VideoBuilder renders (word
+        highlight, glow, scroll transition, audio-reactive pulse) is a pure
+        function of absolute timestamp t, with no state carried across
+        frames: each chunk is rendered independently with no knowledge of
+        its neighbors, so the seams are invisible. A future effect that
+        accumulates state frame-to-frame would break this.
+
+        Returns None (never partial output) on any failure or when this
+        clip doesn't qualify, so callers fall back to the single-process
+        path.
+        """
+        state = self._capture_rebuild_state()
+        if state is None:
+            return None
+
+        duration = self.video_clip.duration
+        if not duration or duration < PARALLEL_RENDER_MIN_DURATION_S:
+            return None
+
+        # Cap worker count so chunks don't get smaller than MIN_CHUNK_DURATION_S:
+        # each worker still builds its own text-segment overlays (see
+        # _render_video_chunk's windowed filtering), so too many workers on a
+        # clip that isn't long enough to amortize that per-worker cost wastes
+        # memory and CPU rather than saving wall time.
+        n_workers = min(
+            max(1, (os.cpu_count() or 2) - 1),
+            max(1, int(duration // MIN_CHUNK_DURATION_S)),
+        )
+
+        # Also cap by actually-available memory: each worker is a full
+        # process (its own moviepy/numpy/PIL/SDK imports, base image, audio,
+        # and frame-compositing buffers -- overlay images and other
+        # per-frame effects add to this), so cpu_count() alone can wildly
+        # overcommit on a machine with many cores but modest RAM, or one
+        # already under memory pressure from other running applications.
+        # Blindly maximizing worker count crashed on real content (multiple
+        # concurrent MemoryError under compose_on/compose_mask) even after
+        # per-worker memory use was fixed -- N processes at once is still N
+        # times one process's peak.
+        try:
+            import psutil
+            available = psutil.virtual_memory().available
+            mem_capped_workers = max(1, int(available * 0.8 // PARALLEL_RENDER_MEM_PER_WORKER_BYTES))
+            n_workers = min(n_workers, mem_capped_workers)
+        except Exception as e:
+            print(f"Could not check available memory ({e}); proceeding with CPU/duration-based worker count.")
+
+        if n_workers <= 1:
+            return None
+
+        boundaries = [i * duration / n_workers for i in range(n_workers + 1)]
+        boundaries[-1] = duration  # exact end, avoid a float-rounding gap
+
+        chunk_dir = tempfile.mkdtemp(prefix="tish_video_chunks_")
+        chunk_paths = [os.path.join(chunk_dir, f"chunk_{i:03d}.mp4") for i in range(n_workers)]
+
+        try:
+            import multiprocessing
+            print(f"Rendering in {n_workers} parallel chunks...")
+            with multiprocessing.Pool(n_workers) as pool:
+                results = pool.starmap(
+                    _render_video_chunk,
+                    [
+                        (state, boundaries[i], boundaries[i + 1], chunk_paths[i])
+                        for i in range(n_workers)
+                    ],
+                )
+
+            if any(r is None for r in results):
+                print("Parallel chunk render failed for at least one chunk; falling back to single-process render.")
+                return None
+
+            concat_list_path = os.path.join(chunk_dir, "concat_list.txt")
+            with open(concat_list_path, "w", encoding="utf-8") as f:
+                for p in chunk_paths:
+                    escaped = p.replace("\\", "/").replace("'", "'\\''")
+                    f.write(f"file '{escaped}'\n")
+
+            concat_output_path = os.path.join(chunk_dir, "concat_output.mp4")
+            import subprocess
+            concat_process = subprocess.run(
+                ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_list_path, "-c", "copy", concat_output_path],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            )
+            if concat_process.returncode != 0 or not os.path.exists(concat_output_path):
+                print(f"FFMPEG concat failed: {concat_process.stderr}")
+                return None
+
+            if self._audio_filepath and os.path.exists(self._audio_filepath):
+                mux_process = subprocess.run(
+                    [
+                        "ffmpeg", "-y",
+                        "-i", concat_output_path,
+                        "-i", self._audio_filepath,
+                        "-c:v", "copy",
+                        "-c:a", "aac",
+                        "-shortest",
+                        output_filepath,
+                    ],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                )
+                if mux_process.returncode != 0:
+                    print(f"FFMPEG audio mux failed: {mux_process.stderr}")
+                    return None
+            else:
+                import shutil
+                shutil.move(concat_output_path, output_filepath)
+
+            print(f"Video saved (via {n_workers}-way parallel render) to: {output_filepath}")
+            return output_filepath
+
+        except Exception as e:
+            print(f"Parallel render failed: {e}")
+            traceback.print_exc()
+            return None
+        finally:
+            import shutil
+            shutil.rmtree(chunk_dir, ignore_errors=True)
+
     def save(self, output_filepath: str) -> Optional[str]:
         """
         Save the video clip to a file.
@@ -726,6 +911,10 @@ class VideoBuilder:
         if output_dir and not os.path.exists(output_dir):
             os.makedirs(output_dir, exist_ok=True)
             print(f"Created output directory: {output_dir}")
+
+        parallel_result = self._save_parallel(output_filepath)
+        if parallel_result:
+            return parallel_result
 
         # Helper to generate a unique temp audio path to avoid WinError 32 locking collisions
         import uuid
@@ -1827,76 +2016,92 @@ class VideoBuilder:
                 merged[-1] = boundaries[-1]
             boundaries = merged
 
-        text_clips = []
-        try:
-            for idx in range(len(boundaries) - 1):
-                t1, t2 = boundaries[idx], boundaries[idx + 1]
-                dur = t2 - t1
-                if dur < 0.01:
-                    continue
-                mid = (t1 + t2) / 2.0
-                cur = current_idx_at(mid)
+        if len(boundaries) < 2:
+            return video_clip
 
-                in_transition = (
-                    scroll_duration > 0 and cur is not None and cur > 0
-                    and (mid - prepared[cur]['start']) < scroll_duration
-                )
+        width, height = video_clip.w, video_clip.h
 
+        # Rasterize one boundary interval's frame at a time instead of
+        # pre-rendering every interval as its own full-canvas ImageClip and
+        # holding all of them in memory simultaneously -- for dense/long
+        # lyrics that pre-render approach can need many GB (each interval's
+        # rasterized RGBA image is full-canvas-sized before compositing; a
+        # few hundred to a few thousand intervals is common for a
+        # multi-minute song). A single-slot cache is enough because
+        # write_videofile requests frames in increasing time order, so
+        # consecutive output frames overwhelmingly land in the same
+        # interval and reuse the same rasterized image rather than
+        # re-rendering it.
+        cache = {'idx': None, 'rgba': None}
+
+        def rasterize(idx: int) -> np.ndarray:
+            if cache['idx'] == idx:
+                return cache['rgba']
+
+            t1, t2 = boundaries[idx], boundaries[idx + 1]
+            mid = (t1 + t2) / 2.0
+            cur = current_idx_at(mid)
+
+            in_transition = (
+                scroll_duration > 0 and cur is not None and cur > 0
+                and (mid - prepared[cur]['start']) < scroll_duration
+            )
+
+            frame_img, frame_x, frame_y = None, 0, 0
+            try:
                 if in_transition:
                     p = max(0.0, min(1.0, (mid - prepared[cur]['start']) / scroll_duration))
                     window_prev = build_window(cur - 1, mid)
                     window_next = build_window(cur, mid)
                     frame_img, (frame_x, frame_y) = self._render_scrolling_lyrics_transition_frame_pil(
-                        video_clip.w, video_clip.h, window_prev, window_next, p, mid, style,
+                        width, height, window_prev, window_next, p, mid, style,
                     )
                 else:
                     window = build_window(cur, mid)
-                    if not window:
-                        continue
-                    frame_img, (frame_x, frame_y) = self._render_scrolling_lyrics_frame_pil(
-                        video_clip.w, video_clip.h, window, mid, style,
-                    )
+                    if window:
+                        frame_img, (frame_x, frame_y) = self._render_scrolling_lyrics_frame_pil(
+                            width, height, window, mid, style,
+                        )
+            except Exception as e:
+                print(f"Error rendering scrolling lyrics frame: {e}")
+                traceback.print_exc()
+
+            canvas = np.zeros((height, width, 4), dtype=np.uint8)
+            if frame_img is not None:
                 frame_arr = np.array(frame_img)
-                if frame_arr.size == 0:
-                    continue
+                if frame_arr.size:
+                    fh, fw = frame_arr.shape[:2]
+                    x0, y0 = max(0, frame_x), max(0, frame_y)
+                    x1, y1 = min(width, frame_x + fw), min(height, frame_y + fh)
+                    if x1 > x0 and y1 > y0:
+                        canvas[y0:y1, x0:x1] = frame_arr[y0 - frame_y:y1 - frame_y, x0 - frame_x:x1 - frame_x]
 
-                rgb_arr = frame_arr[:, :, :3]
-                alpha_arr = (frame_arr[:, :, 3] / 255.0).astype(np.float32)
+            cache['idx'] = idx
+            cache['rgba'] = canvas
+            return canvas
 
-                img_clip = ImageClip(rgb_arr)
-                mask_clip = ImageClip(alpha_arr, is_mask=True)
-                img_clip = img_clip.with_mask(mask_clip)
-                img_clip = img_clip.with_start(t1).with_duration(dur).with_position((frame_x, frame_y))
-                text_clips.append(img_clip)
+        def boundary_index_at(t: float) -> int:
+            idx = bisect.bisect_right(boundaries, t) - 1
+            return max(0, min(idx, len(boundaries) - 2))
 
-        except Exception as e:
-            print(f"Error rendering scrolling lyrics frames: {e}")
-            traceback.print_exc()
-            for clip in text_clips:
-                try:
-                    clip.close()
-                except:
-                    pass
-            return None
+        def make_frame(t):
+            return rasterize(boundary_index_at(t))[:, :, :3]
 
-        print(f"DEBUG: Created {len(text_clips)} scrolling-lyrics text clips")
-        if not text_clips:
-            return video_clip
+        def make_mask_frame(t):
+            return rasterize(boundary_index_at(t))[:, :, 3].astype(np.float32) / 255.0
 
         try:
-            print("DEBUG: Compositing video with scrolling lyrics clips...")
-            final_clip = CompositeVideoClip([video_clip] + text_clips)
+            print("DEBUG: Compositing video with lazily-rasterized scrolling lyrics overlay...")
+            overlay_mask = VideoClip(frame_function=make_mask_frame, is_mask=True, duration=clip_duration)
+            overlay_clip = VideoClip(frame_function=make_frame, duration=clip_duration).with_mask(overlay_mask)
+            final_clip = CompositeVideoClip([video_clip, overlay_clip])
             if video_clip.audio:
                 final_clip = final_clip.with_audio(video_clip.audio)
             return final_clip
 
         except Exception as e:
             print(f"Error compositing video with scrolling lyrics: {e}")
-            for clip in text_clips:
-                try:
-                    clip.close()
-                except:
-                    pass
+            traceback.print_exc()
             return None
 
     def _layout_lyric_row(self, words: List[Dict], font: ImageFont.FreeTypeFont, max_w: int, get_word_size) -> List[List[Tuple[Dict, int, int]]]:
@@ -2538,3 +2743,84 @@ class VideoBuilder:
             self.cleanup_cache()
         except:
             pass
+
+
+# Extra time before/after a chunk's own [t0, t1) window that a text segment
+# might still need to be included for: TextStyle.upcoming_lead lets a line
+# appear before its own start, scroll_duration lets a transition reach past
+# a segment's end, plus a fixed safety margin for context_lines neighbors.
+_CHUNK_SEGMENT_PAD_S = 10.0
+
+
+def _segments_overlapping_window(segments: Optional[List[Dict]], window_start: float, window_end: float) -> Optional[List[Dict]]:
+    """Subset of `segments` whose own [start, end] overlaps [window_start,
+    window_end]. _render_video_chunk uses this so a worker only builds the
+    per-segment overlay clips (word-highlight, glow, scrolling-lyrics
+    frames) its own chunk can actually show, instead of every segment in
+    the whole video -- building every segment in each of N concurrent
+    workers is what exhausted memory before this filter existed.
+    """
+    if not segments:
+        return segments
+    return [
+        seg for seg in segments
+        if seg.get('end', seg.get('start', 0)) >= window_start and seg.get('start', 0) <= window_end
+    ]
+
+
+def _render_video_chunk(state: Dict, t0: float, t1: float, chunk_output_path: str) -> Optional[str]:
+    """Runs in its own worker process, spawned by VideoBuilder._save_parallel:
+    rebuilds an equivalent VideoBuilder from a plain-data state snapshot,
+    then writes only the [t0, t1) slice of it, silently -- the caller muxes
+    the original full audio back in once, after every chunk is
+    concatenated. Must stay a module-level function (not a method or
+    closure) so it's importable and picklable across a Windows `spawn`
+    process boundary.
+    """
+    try:
+        style = state['text_style']
+        pad = _CHUNK_SEGMENT_PAD_S
+        if style is not None:
+            pad = max(pad, (style.upcoming_lead or 0) + (style.scroll_duration or 0) + 5.0)
+        window_start, window_end = t0 - pad, t1 + pad
+
+        builder = VideoBuilder(fps=state['fps'], width=state['width'], height=state['height'])
+        builder._image_filepath = state['image_filepath']
+        builder._image_segments = state['image_segments']
+        builder._audio_filepath = state['audio_filepath']
+        builder._text_segments = _segments_overlapping_window(state['text_segments'], window_start, window_end)
+        builder._text_style = state['text_style']
+        builder._overlay_images = state['overlay_images']
+        builder._overlay_video_path = state['overlay_video_path']
+        builder._overlay_video_config = state['overlay_video_config']
+
+        clip = builder.build()
+        if clip is None:
+            return None
+
+        # A worker's own reload of the same audio file can measure a
+        # fractionally different duration than the main process did when it
+        # first computed chunk boundaries (observed ~0.4s drift in testing,
+        # not just float rounding), and the attached audio clip can itself
+        # measure shorter than the video clip's own .duration -- subclipped()
+        # applies to both, so clamp against whichever is more restrictive.
+        clip_duration = clip.duration
+        if clip.audio is not None and clip.audio.duration is not None:
+            clip_duration = min(clip_duration, clip.audio.duration)
+        t0 = max(0.0, min(t0, clip_duration))
+        t1 = max(t0, min(t1, clip_duration))
+        if t1 <= t0:
+            return None
+
+        chunk_clip = clip.subclipped(t0, t1)
+        chunk_clip.write_videofile(
+            chunk_output_path,
+            fps=state['fps'],
+            codec="libx264",
+            audio=False,
+            logger=None,
+        )
+        return chunk_output_path
+    except Exception:
+        traceback.print_exc()
+        return None

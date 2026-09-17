@@ -44,6 +44,10 @@ _Avoid_: building a `genai.Client`/`ChatGoogleGenerativeAI` directly anywhere ou
 `reasoning.is_mock(language_code)` -- whether language_code's chain currently resolves to the mock provider. Lets a consuming app gate its *own* mock behavior (e.g. swapping in a fake `MusicManager` for a coherent dummy end-to-end test run) on the same test-mode signal reasoning.py itself uses, without ever inspecting a credential string. The mock response *content* for an app's own bespoke calls (e.g. Daily_Readings' canned meditation text/image descriptions) stays app-specific and lives in the app, guarded by this check -- only the generic "am I in mock mode" question belongs in the SDK.
 _Avoid_: reconstructing this by checking a credential value yourself
 
+**Per-frame effect purity**:
+Every per-frame visual/audio effect `VideoBuilder` renders (karaoke word-highlight, glow, scrolling-lyrics transition, audio-reactive pulse) must be a pure function of the clip's absolute timestamp `t` — no state carried across successive frames. This is what makes `VideoBuilder.save()`'s chunked parallel rendering (ADR 0013) correct: each worker process renders an independent absolute-time range of the same clip, and the seams are invisible only because no effect depends on what came before it.
+_Avoid_: adding an effect that reads or mutates instance state across successive `get_frame(t)` calls (e.g. an accumulating counter, a running average) — it will look correct under today's single-process serial write and then render visibly wrong at chunk boundaries the moment it's split across parallel workers.
+
 **tier**:
 `"fast" | "balanced" | "deep"` — the speed/capability level `reasoning.generate()` asks for, not a model name. The mapping to an actual model lives once per provider in code (e.g. `GeminiReasoningPack._TIER_MODELS`), not per language in `reasoning_packs.json`, since it's a property of the model family, not of the language — this is what lets a future model or provider get wired in without any call site changing.
 _Avoid_: passing a raw model name (`"gemini-2.5-pro"`, ...) from application code — ask for a tier instead

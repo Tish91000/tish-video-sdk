@@ -111,7 +111,11 @@ class GeminiReasoningPack(ReasoningPack):
 
     # tier -> model name. Owned here (per provider, in code) rather than per
     # language in reasoning_packs.json, since it's a property of the model
-    # family, not of the language -- see CONTEXT.md's "tier" entry.
+    # family, not of the language -- see CONTEXT.md's "tier" entry. A pack's
+    # own entry can override individual tiers via an optional "models" dict
+    # (e.g. a newer API key whose project no longer has access to the 2.5
+    # family: {"balanced": "gemini-3.6-flash"}) without changing the default
+    # for every other language/project using this same provider.
     _TIER_MODELS = {
         "fast": "gemini-2.5-flash-lite",
         "balanced": "gemini-2.5-flash",
@@ -123,6 +127,7 @@ class GeminiReasoningPack(ReasoningPack):
     def __init__(self, entry: dict):
         super().__init__(entry)
         self._client = None
+        self._tier_models = {**self._TIER_MODELS, **entry.get("models", {})}
 
     def load_model(self) -> None:
         if not self.credentials:
@@ -132,9 +137,9 @@ class GeminiReasoningPack(ReasoningPack):
 
     def _model_for_tier(self, tier: str) -> str:
         try:
-            return self._TIER_MODELS[tier]
+            return self._tier_models[tier]
         except KeyError:
-            known = ", ".join(sorted(self._TIER_MODELS))
+            known = ", ".join(sorted(self._tier_models))
             raise ValueError(f"Unknown reasoning tier '{tier}'. Known tiers: {known}.")
 
     def generate(self, prompt: str, tier: str) -> str:

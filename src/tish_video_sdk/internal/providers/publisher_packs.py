@@ -539,6 +539,57 @@ class YouTubePublisherPack(PublisherPack):
             print(f"Error uploading thumbnail: {e}")
             return False
 
+    def _find_or_create_playlist(self, title: str, privacy_status: str) -> Optional[str]:
+        """Playlist id for `title` (case-insensitive match on the authenticated
+        channel's own playlists), created with `privacy_status` if missing.
+        The id is cached per instance so a session only looks it up once."""
+        cache = self.__dict__.setdefault("_playlist_ids", {})
+        key = title.strip().lower()
+        if key in cache:
+            return cache[key]
+
+        page_token = None
+        while True:
+            response = self.service.playlists().list(
+                part="snippet", mine=True, maxResults=50, pageToken=page_token,
+            ).execute()
+            for playlist in response.get("items", []):
+                if playlist["snippet"]["title"].strip().lower() == key:
+                    cache[key] = playlist["id"]
+                    return cache[key]
+            page_token = response.get("nextPageToken")
+            if not page_token:
+                break
+
+        created = self.service.playlists().insert(
+            part="snippet,status",
+            body={"snippet": {"title": title}, "status": {"privacyStatus": privacy_status}},
+        ).execute()
+        cache[key] = created["id"]
+        return cache[key]
+
+    def add_video_to_playlist(self, video_id: str, playlist_title: str, privacy_status: str = "unlisted") -> bool:
+        """Adds `video_id` to the channel playlist named `playlist_title`,
+        creating that playlist (with `privacy_status`) if it doesn't exist.
+        Retries once on YouTube's transient 409 "operation aborted"."""
+        from googleapiclient.errors import HttpError
+
+        if not self._ensure_service():
+            return False
+        try:
+            playlist_id = self._find_or_create_playlist(playlist_title, privacy_status)
+            body = {"snippet": {"playlistId": playlist_id, "resourceId": {"kind": "youtube#video", "videoId": video_id}}}
+            for attempt in (1, 2):
+                try:
+                    self.service.playlistItems().insert(part="snippet", body=body).execute()
+                    return True
+                except HttpError as e:
+                    if attempt == 2 or e.resp.status != 409:
+                        raise
+        except Exception as e:
+            print(f"Error adding video {video_id} to playlist '{playlist_title}': {e}")
+            return False
+
 
 class InstagramPublisherPack(PublisherPack):
     """Publishes Reels to Instagram via instagrapi. Logs in lazily on first

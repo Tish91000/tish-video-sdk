@@ -16,6 +16,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import unicodedata
 from bs4 import BeautifulSoup
 from typing import Tuple, Optional, List, Dict
 
@@ -41,6 +42,69 @@ def get_subtitle_pack(language_code: str) -> Optional[SubtitlePack]:
     """The configured SubtitlePack for `language_code`, or None if none is
     configured (via built-in defaults or SUBTITLE_PACKS_PATH)."""
     return _ALL_SUBTITLE_PACKS.get(language_code)
+
+
+def _mfa_dictionary_key(word: str) -> str:
+    """A deliberately loose, case/punctuation/compatibility-insensitive form
+    of a word, for deciding which dictionary entries a transcript could need.
+    Looser than whatever MFA itself normalizes to on purpose: matching more
+    entries than MFA would is harmless, matching fewer would change the
+    alignment."""
+    word = unicodedata.normalize("NFKC", word).lower()
+    # Drop punctuation/symbols only -- Tamil vowel signs and pulli are
+    # combining *marks* (Mn/Mc), which must stay.
+    return "".join(c for c in word if unicodedata.category(c)[0] not in ("P", "S"))
+
+
+def _write_subset_dictionary(
+    model_name: str,
+    texts: List[str],
+    dest_path: str,
+    pronunciations: Optional[Dict[str, str]] = None,
+    full: bool = False,
+) -> bool:
+    """Write the entries of MFA's `model_name` dictionary that `texts` could
+    use (every entry if `full`) to dest_path, plus `pronunciations`
+    ({word: space-separated phones}), which replace any dictionary entries
+    for the same words. Returns False (caller keeps using the full
+    dictionary by name) if the dictionary file can't be found or nothing
+    was written.
+
+    MFA loads and compiles the *entire* dictionary on every run -- for
+    tamil_cv (~136k entries) that was ~34 s of a ~62 s run whose actual
+    alignment took ~2 s -- yet a song's lyrics only ever use a few hundred of
+    those words. Words absent from the dictionary stay out-of-vocabulary
+    either way, so alignment is unchanged."""
+    root = os.getenv("MFA_ROOT_DIR") or os.path.join(os.path.expanduser("~"), "Documents", "MFA")
+    source_path = os.path.join(root, "pretrained_models", "dictionary", f"{model_name}.dict")
+    if not os.path.isfile(source_path):
+        return False
+
+    pronunciations = pronunciations or {}
+    overridden = {_mfa_dictionary_key(word) for word in pronunciations}
+    wanted = set()
+    for text in texts:
+        for token in text.split():
+            wanted.add(_mfa_dictionary_key(token))
+            # MFA can split compounds/contractions into their parts.
+            wanted.update(_mfa_dictionary_key(part) for part in re.split(r"[-'’‘_]", token))
+    wanted.discard("")
+
+    kept = 0
+    try:
+        with open(source_path, "r", encoding="utf-8") as src, \
+                open(dest_path, "w", encoding="utf-8", newline="\n") as dest:
+            for line in src:
+                key = _mfa_dictionary_key(line.split("\t", 1)[0])
+                if key not in overridden and (full or key in wanted):
+                    dest.write(line)
+                    kept += 1
+            for word, phones in pronunciations.items():
+                dest.write(f"{word}\t{phones}\n")
+                kept += 1
+    except (OSError, UnicodeError):
+        return False
+    return kept > 0
 
 
 MFA_ERROR_MESSAGE = (
@@ -78,6 +142,7 @@ class SubtitleBuilder:
         self._retry_beam: Optional[int] = None
         self._aligned_words: List[Dict] = []
         self._segments: Optional[List[Dict]] = None
+        self._pronunciations: Dict[str, str] = {}
 
     @classmethod
     def from_audio(cls, audio_filepath: str, language_code: str) -> 'SubtitleBuilder':
@@ -93,6 +158,7 @@ class SubtitleBuilder:
         language_code: str,
         beam: Optional[int] = None,
         retry_beam: Optional[int] = None,
+        pronunciations: Optional[Dict[str, str]] = None,
     ) -> 'SubtitleBuilder':
         """
         Args:
@@ -100,12 +166,17 @@ class SubtitleBuilder:
                 Omit to use MFA's own defaults, which can fail to align long
                 audio treated as one utterance; widening the beam fixes it
                 at the cost of slower alignment.
+            pronunciations: Extra MFA dictionary entries, {word: space-separated
+                phones in the model's phone set}, for words the stock
+                dictionary lacks (e.g. Latin-script Tamil lyrics). Replace
+                any stock entries for the same words.
         """
         builder = cls(language_code)
         builder._audio_filepath = audio_filepath
         builder._reference_text = reference_text
         builder._beam = beam
         builder._retry_beam = retry_beam
+        builder._pronunciations = dict(pronunciations or {})
         return builder
 
     @classmethod
@@ -116,6 +187,7 @@ class SubtitleBuilder:
         language_code: str,
         beam: Optional[int] = None,
         retry_beam: Optional[int] = None,
+        pronunciations: Optional[Dict[str, str]] = None,
     ) -> 'SubtitleBuilder':
         """
         Align many known-boundary segments of one audio file (e.g. one per
@@ -127,13 +199,14 @@ class SubtitleBuilder:
             audio_filepath: One audio file covering all segments.
             segments (List[Dict]): `{"start", "end", "text"}` dicts (seconds),
                 in the audio's own timeline, non-overlapping.
-            beam, retry_beam: See from_audio_with_reference.
+            beam, retry_beam, pronunciations: See from_audio_with_reference.
         """
         builder = cls(language_code)
         builder._audio_filepath = audio_filepath
         builder._segments = segments
         builder._beam = beam
         builder._retry_beam = retry_beam
+        builder._pronunciations = dict(pronunciations or {})
         return builder
 
     def build(self) -> Optional['SubtitleBuilder']:
@@ -330,6 +403,32 @@ class SubtitleBuilder:
 
         return re.sub(r'\s+', ' ', plain_text).strip()
 
+    def _mfa_dictionary_arg(self, model_name: str, texts: List[str], work_dir: str) -> str:
+        """What to pass `mfa align` as its dictionary: a per-run subset file
+        holding just the entries `texts` can use (plus any extra
+        `pronunciations` given to the builder), or the full dictionary's
+        name if a subset can't be built (or TISH_MFA_FULL_DICTIONARY is set
+        -- then still a full copy when extra pronunciations need adding)."""
+        full = bool(os.getenv("TISH_MFA_FULL_DICTIONARY"))
+        if full and not self._pronunciations:
+            return model_name
+        subset_path = os.path.join(work_dir, f"{model_name}_subset.dict")
+        if _write_subset_dictionary(model_name, texts, subset_path, self._pronunciations, full=full):
+            return subset_path
+        if self._pronunciations:
+            print("Warning: couldn't write MFA dictionary with extra pronunciations -- using the stock dictionary.")
+        return model_name
+
+    @staticmethod
+    def _report_missing_mfa_output(json_path: str, result: subprocess.CompletedProcess) -> None:
+        """MFA exits 0 yet writes no output when it couldn't align any
+        utterance (e.g. every word out-of-vocabulary) -- show its own log
+        tail so the cause isn't hidden."""
+        print(f"Error: MFA did not produce expected output at '{json_path}'.")
+        log_tail = ((result.stdout or "") + (result.stderr or "")).strip()[-3000:]
+        if log_tail:
+            print(f"MFA output (tail):\n{log_tail}")
+
     @staticmethod
     def _build_utterances_textgrid(duration: float, segments: List[Tuple[float, float, str]]) -> str:
         """A minimal Praat TextGrid with one IntervalTier ("utterances"),
@@ -420,8 +519,11 @@ class SubtitleBuilder:
                 f.write(textgrid)
 
             output_dir = os.path.join(corpus_dir, "output")
+            dictionary = self._mfa_dictionary_arg(
+                model_name, [text for _, _, text in cleaned_segments], corpus_dir
+            )
             align_cmd = [
-                mfa_exe, "align", corpus_dir, model_name, model_name, output_dir,
+                mfa_exe, "align", corpus_dir, dictionary, model_name, output_dir,
                 "--clean", "--output_format", "json",
             ]
             if self._beam is not None:
@@ -438,7 +540,7 @@ class SubtitleBuilder:
 
             json_path = os.path.join(output_dir, "speaker1", f"{utterance_name}.json")
             if not os.path.exists(json_path):
-                print(f"Error: MFA did not produce expected output at '{json_path}'.")
+                self._report_missing_mfa_output(json_path, result)
                 return None
 
             with open(json_path, "r", encoding="utf-8") as f:
@@ -516,8 +618,9 @@ class SubtitleBuilder:
                 f.write(plain_text)
 
             output_dir = os.path.join(corpus_dir, "output")
+            dictionary = self._mfa_dictionary_arg(model_name, [plain_text], corpus_dir)
             align_cmd = [
-                mfa_exe, "align", corpus_dir, model_name, model_name, output_dir,
+                mfa_exe, "align", corpus_dir, dictionary, model_name, output_dir,
                 "--clean", "--output_format", "json",
             ]
             if self._beam is not None:
@@ -539,7 +642,7 @@ class SubtitleBuilder:
 
             json_path = os.path.join(output_dir, "speaker1", f"{utterance_name}.json")
             if not os.path.exists(json_path):
-                print(f"Error: MFA did not produce expected output at '{json_path}'.")
+                self._report_missing_mfa_output(json_path, result)
                 return None
 
             with open(json_path, "r", encoding="utf-8") as f:

@@ -56,12 +56,178 @@ PARALLEL_RENDER_MIN_DURATION_S = 30.0
 # this -- caps how many workers save() spawns for a given duration.
 MIN_CHUNK_DURATION_S = 20.0
 
-# Conservative per-worker memory budget for chunked parallel rendering:
-# each worker is a full process re-importing the SDK/moviepy/numpy/PIL,
-# holding the base image/audio, and compositing overlay images plus the
-# lyrics overlay frame-by-frame. Used to cap worker count against actually
-# -available memory, not just CPU count.
-PARALLEL_RENDER_MEM_PER_WORKER_BYTES = 2 * 1024 ** 3  # 2 GiB
+# libx264 threads per chunk worker. Left on ffmpeg's default, x264 sizes its
+# thread pool to the core count, and every frame-thread holds its own frame
+# buffers and lookahead: on a 16-core machine each worker's ffmpeg child
+# alone took ~880 MB. Two threads cut that to ~430 MB with no measurable
+# slowdown -- a worker's Python-side compositing (~3 fps at 1080p with glow)
+# is the bottleneck, so the encoder is never the one waiting on threads.
+PARALLEL_RENDER_ENCODER_THREADS = 2
+
+# Per-worker memory budget for chunked parallel rendering, used to cap the
+# worker count against actually-available memory, not just CPU count.
+# Measured on a real 1080p/20fps karaoke render (glow, thumbnail overlay,
+# scrolling lyrics) with PARALLEL_RENDER_ENCODER_THREADS above: ~0.9 GB peak
+# per worker (Python process ~0.46 GB + its ffmpeg child ~0.43 GB). 1.25 GiB
+# leaves ~40% headroom for longer chunks (bigger glow cache) and heavier
+# configs (overlay video, higher resolution).
+PARALLEL_RENDER_MEM_PER_WORKER_BYTES = int(1.25 * 1024 ** 3)
+
+# Escape hatches for the worker-count decision in VideoBuilder._save_parallel
+# (the 2 GiB budget above is a guess, not a measurement of a full karaoke
+# render): TISH_VIDEO_RENDER_WORKERS forces the worker count, bypassing the
+# CPU and memory caps (the minimum-chunk-duration cap still applies);
+# TISH_VIDEO_MEM_PER_WORKER_MB replaces the per-worker memory budget.
+RENDER_WORKERS_ENV = "TISH_VIDEO_RENDER_WORKERS"
+MEM_PER_WORKER_MB_ENV = "TISH_VIDEO_MEM_PER_WORKER_MB"
+
+# NVENC's own rate-control defaults roughly double libx264's default
+# bitrate for a comparable/lower perceptual result (measured: 1.15Mbps vs
+# 507kbps encoding the same karaoke clip) -- -cq 23 targets libx264's own
+# default quality instead, so switching encoders doesn't silently bloat
+# upload size. -b:v 0 is required by ffmpeg to let -cq (not a bitrate cap)
+# actually drive quality in VBR mode.
+_NVENC_QUALITY_PARAMS = ["-rc", "vbr", "-cq", "23", "-b:v", "0"]
+
+# Cache of (codec, ffmpeg_params) from _resolve_video_codec(), so repeated
+# saves in one process don't re-probe. None means "not probed yet".
+_video_codec_cache: Optional[Tuple[str, Optional[List[str]]]] = None
+
+
+def _moviepy_ffmpeg_exe() -> str:
+    """moviepy's own bundled ffmpeg (via imageio_ffmpeg), falling back to
+    whatever "ffmpeg" is on PATH -- see _resolve_video_codec for why the
+    bundled one is the right binary to probe and validate against."""
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return "ffmpeg"
+
+
+def _env_positive_int(name: str) -> Optional[int]:
+    raw = os.environ.get(name)
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value < 1:
+        print(f"Ignoring {name}={raw!r}: expected a positive integer.")
+        return None
+    return value
+
+
+def _resolve_video_codec() -> Tuple[str, Optional[List[str]]]:
+    """Picks h264_nvenc (NVIDIA's hardware encoder) over ffmpeg's software
+    libx264 when a GPU + ffmpeg build actually support it -- ~45% faster
+    end-to-end on a karaoke-style render in benchmarking (glow + per-word
+    highlight compositing still dominates total render time -- see
+    _save_parallel's docstring -- but a faster encode still meaningfully
+    cuts the rest). Falls back to libx264 on any machine without a working
+    NVENC (probe failure, no NVIDIA GPU, driver too old, ...) -- this must
+    never be the reason a render fails.
+
+    Probes by actually encoding one throwaway frame rather than just
+    grepping `ffmpeg -encoders` -- the encoder can be *listed* by a build
+    that supports it while still failing at runtime (no GPU present, driver
+    too old for this ffmpeg's NVENC SDK version), and that failure needs to
+    be caught here, once, rather than mid-render.
+
+    Probes moviepy's own bundled ffmpeg binary (via imageio_ffmpeg), not
+    whatever "ffmpeg" resolves to on PATH -- moviepy writes video through
+    that bundled binary regardless of what else is installed, and the two
+    can disagree: on this machine, a newer system ffmpeg (from a separate
+    winget install) refuses h264_nvenc outright ("Driver does not support
+    the required nvenc API version"), while moviepy's older bundled ffmpeg
+    works fine against the same driver. Probing the wrong binary would
+    report the GPU path unavailable when it isn't.
+    """
+    global _video_codec_cache
+    if _video_codec_cache is not None:
+        return _video_codec_cache
+
+    import subprocess
+    ffmpeg_exe = _moviepy_ffmpeg_exe()
+
+    try:
+        probe = subprocess.run(
+            [
+                ffmpeg_exe, "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "color=black:s=64x64:d=0.1",
+                "-frames:v", "1", "-c:v", "h264_nvenc", "-f", "null", "-",
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15,
+        )
+        if probe.returncode == 0:
+            print("GPU encoder (h264_nvenc) detected -- using it for video render.")
+            _video_codec_cache = ("h264_nvenc", _NVENC_QUALITY_PARAMS)
+            return _video_codec_cache
+    except Exception:
+        pass
+
+    _video_codec_cache = ("libx264", None)
+    return _video_codec_cache
+
+
+def _count_decode_errors(video_filepath: str) -> Optional[int]:
+    """Decodes every frame of video_filepath to a null sink with moviepy's
+    bundled ffmpeg and returns how many error lines it reported (0 = clean),
+    or None if the check itself couldn't run -- that's not evidence the file
+    is bad, so callers must not treat it as a failure."""
+    if not os.path.exists(video_filepath):
+        return None
+    import subprocess
+    try:
+        proc = subprocess.run(
+            [_moviepy_ffmpeg_exe(), "-v", "error", "-i", video_filepath, "-f", "null", "-"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            encoding="utf-8", errors="replace",
+        )
+    except Exception as e:
+        print(f"Could not validate {video_filepath} ({e}); assuming it is fine.")
+        return None
+    error_lines = [line for line in proc.stderr.splitlines() if line.strip()]
+    if proc.returncode != 0 and not error_lines:
+        return 1
+    return len(error_lines)
+
+
+def _write_videofile_gpu_first(clip, output_filepath: str, **kwargs) -> None:
+    """write_videofile, preferring the GPU encoder resolved by
+    _resolve_video_codec(). If the GPU encode raises for any reason (VRAM
+    exhaustion, driver hiccup, NVENC session limit under concurrent use,
+    ...) -- as opposed to simply being unavailable, which _resolve_video_codec
+    already handles -- falls back to libx264 for this call and every
+    subsequent one in this process, since a real render should never fail
+    just because the fast path stopped working partway through.
+
+    A GPU encode that finishes without raising is also decoded end to end
+    before it's trusted: NVENC has been observed producing a file that
+    reports the right duration and exit code 0 but is unplayable (thousands
+    of "Invalid NAL unit size" errors), which write_videofile has no way to
+    notice. A file that fails that check is re-encoded with libx264.
+    """
+    global _video_codec_cache
+    codec, ffmpeg_params = _resolve_video_codec()
+    extra = {"ffmpeg_params": ffmpeg_params} if ffmpeg_params else {}
+    try:
+        clip.write_videofile(output_filepath, codec=codec, **extra, **kwargs)
+        if codec == "libx264":
+            return
+        error_count = _count_decode_errors(output_filepath)
+        if not error_count:
+            return
+        print(f"GPU encode ({codec}) produced a corrupt file ({error_count} decode errors); "
+              "re-encoding with libx264 for the rest of this run.")
+    except Exception:
+        if codec == "libx264":
+            raise
+        print(f"GPU encode ({codec}) failed; falling back to libx264 for the rest of this run.")
+    _video_codec_cache = ("libx264", None)
+    clip.write_videofile(output_filepath, codec="libx264", **kwargs)
+
 
 # Font mapping for common families, resolved against the Windows Fonts folder.
 DEFAULT_FONT_SIZE = 50
@@ -708,7 +874,17 @@ class VideoBuilder:
         # Step 2.7: Add timed text segments (titles, captions, subtitles, ...) if configured
         if self._text_segments and not self._advanced_segments:
             print("Adding text segments to video clip...")
-            text_clip = self._overlay_text_segments_on_single_clip(self.video_clip, self._text_segments)
+            # The picture never changes over time only for a single image
+            # (plus static overlay images) -- multi-image/advanced segments
+            # and an overlay video all animate it.
+            static_background = (
+                bool(self._image_filepath)
+                and not self._image_segments
+                and not self._overlay_video_path
+            )
+            text_clip = self._overlay_text_segments_on_single_clip(
+                self.video_clip, self._text_segments, static_background=static_background,
+            )
 
             if text_clip is None:
                 print("Failed to add text segments to video clip.")
@@ -798,10 +974,11 @@ class VideoBuilder:
         # _render_video_chunk's windowed filtering), so too many workers on a
         # clip that isn't long enough to amortize that per-worker cost wastes
         # memory and CPU rather than saving wall time.
-        n_workers = min(
-            max(1, (os.cpu_count() or 2) - 1),
-            max(1, int(duration // MIN_CHUNK_DURATION_S)),
-        )
+        cpu_cap = max(1, (os.cpu_count() or 2) - 1)
+        duration_cap = max(1, int(duration // MIN_CHUNK_DURATION_S))
+        n_workers = min(cpu_cap, duration_cap)
+        mem_note = "memory unchecked"
+        mem_capped_workers = None
 
         # Also cap by actually-available memory: each worker is a full
         # process (its own moviepy/numpy/PIL/SDK imports, base image, audio,
@@ -813,15 +990,43 @@ class VideoBuilder:
         # concurrent MemoryError under compose_on/compose_mask) even after
         # per-worker memory use was fixed -- N processes at once is still N
         # times one process's peak.
+        mem_per_worker_mb = _env_positive_int(MEM_PER_WORKER_MB_ENV)
+        mem_per_worker = (
+            mem_per_worker_mb * 1024 ** 2 if mem_per_worker_mb
+            else PARALLEL_RENDER_MEM_PER_WORKER_BYTES
+        )
         try:
             import psutil
             available = psutil.virtual_memory().available
-            mem_capped_workers = max(1, int(available * 0.8 // PARALLEL_RENDER_MEM_PER_WORKER_BYTES))
+            mem_capped_workers = max(1, int(available * 0.8 // mem_per_worker))
+            mem_note = f"free RAM {available / 1024 ** 3:.1f} GiB -> memory cap {mem_capped_workers}"
             n_workers = min(n_workers, mem_capped_workers)
         except Exception as e:
             print(f"Could not check available memory ({e}); proceeding with CPU/duration-based worker count.")
 
+        forced_workers = _env_positive_int(RENDER_WORKERS_ENV)
+        if forced_workers:
+            n_workers = min(forced_workers, duration_cap)
+            mem_note += f"; {RENDER_WORKERS_ENV}={forced_workers} overrides cpu/memory caps"
+
+        print(
+            f"Parallel render: {n_workers} worker(s) "
+            f"(cpu cap {cpu_cap}; duration cap {duration_cap}; {mem_note}) - "
+            f"{'chunked parallel' if n_workers > 1 else 'running single-process'}"
+        )
+
         if n_workers <= 1:
+            if (
+                not forced_workers
+                and mem_capped_workers is not None
+                and mem_capped_workers < min(cpu_cap, duration_cap)
+            ):
+                print(
+                    f"WARNING: parallel render skipped for lack of free memory on a {duration:.0f}s clip "
+                    f"that would otherwise use {min(cpu_cap, duration_cap)} workers; the single-process "
+                    f"render will be much slower. Free some RAM, or set {RENDER_WORKERS_ENV} / "
+                    f"{MEM_PER_WORKER_MB_ENV} to override."
+                )
             return None
 
         boundaries = [i * duration / n_workers for i in range(n_workers + 1)]
@@ -927,10 +1132,9 @@ class VideoBuilder:
         temp_audio_1 = get_temp_audio_path(output_filepath)
         try:
             print(f"Writing video to: {output_filepath}")
-            self.video_clip.write_videofile(
-                output_filepath,
+            _write_videofile_gpu_first(
+                self.video_clip, output_filepath,
                 fps=getattr(self.video_clip, 'fps', DEFAULT_FPS),
-                codec="libx264",
                 audio_codec="aac",
                 temp_audiofile=temp_audio_1,
                 remove_temp=True
@@ -949,10 +1153,9 @@ class VideoBuilder:
                 temp_video_silent = output_filepath + ".silent_temp.mp4"
                 try:
                     # 1. Write video ONLY (Silent) - This avoids the broken audio reading
-                    self.video_clip.write_videofile(
-                        temp_video_silent,
+                    _write_videofile_gpu_first(
+                        self.video_clip, temp_video_silent,
                         fps=getattr(self.video_clip, 'fps', DEFAULT_FPS),
-                        codec="libx264",
                         audio=False, # Disable audio reading
                         logger=None # Suppress bars
                     )
@@ -1725,13 +1928,18 @@ class VideoBuilder:
 
         return img.crop((left, top, right, bottom)), (left, top)
 
-    def _overlay_text_segments_on_single_clip(self, video_clip: VideoFileClip, segments: List[Dict]) -> Optional[VideoFileClip]:
+    def _overlay_text_segments_on_single_clip(self, video_clip: VideoFileClip, segments: List[Dict], static_background: bool = False) -> Optional[VideoFileClip]:
         """Overlay timed text segments on a single video clip using PIL rendering.
 
         Each segment becomes one or more per-word-interval ImageClips (so a
         segment with word-level timestamps animates a highlighted "active
         word" as it's read); a segment with no 'words' renders as static text
-        for its whole start/end span."""
+        for its whole start/end span.
+
+        static_background: the caller guarantees video_clip's picture never
+        changes over time (a single image, plus static overlay images), which
+        lets the scrolling-lyrics path composite far less per frame -- see
+        _overlay_scrolling_lyrics_on_single_clip."""
         print(f"DEBUG: _overlay_text_segments_on_single_clip called with {len(segments)} segments")
         if not segments:
             print("DEBUG: No text segments provided, returning original clip")
@@ -1740,7 +1948,7 @@ class VideoBuilder:
         style = self._text_style or TextStyle()
 
         if style.context_lines > 0:
-            return self._overlay_scrolling_lyrics_on_single_clip(video_clip, segments, style)
+            return self._overlay_scrolling_lyrics_on_single_clip(video_clip, segments, style, static_background)
 
         text_clips = []
 
@@ -1894,12 +2102,19 @@ class VideoBuilder:
                     pass
             return None
 
-    def _overlay_scrolling_lyrics_on_single_clip(self, video_clip: VideoFileClip, segments: List[Dict], style: TextStyle) -> Optional[VideoFileClip]:
+    def _overlay_scrolling_lyrics_on_single_clip(self, video_clip: VideoFileClip, segments: List[Dict], style: TextStyle, static_background: bool = False) -> Optional[VideoFileClip]:
         """Scrolling multi-line lyric display (style.context_lines > 0):
         shows the current line plus lines before/after it, stacked around
         the current line's fixed position so earlier/later lines scroll as
         it advances. An upcoming line only joins the window
-        style.upcoming_lead seconds before its own start."""
+        style.upcoming_lead seconds before its own start.
+
+        With static_background (video_clip's picture never changes), the
+        background is composited once and each distinct lyric frame is
+        blended only over its own bounding box and cached per boundary
+        interval -- instead of moviepy re-compositing full 1080p layers
+        (astype/mask/alpha_composite) for every output frame, which is what
+        bounds single-process render speed."""
         offset = getattr(style, 'timing_offset', 0.0)
         prepared = []
         for segment in segments:
@@ -1916,6 +2131,7 @@ class VideoBuilder:
                         'word': w.get('word', ''),
                         'start': w.get('start', 0.0) + offset,
                         'end': w.get('end', 0.0) + offset,
+                        'vanish': bool(w.get('vanish', False)),
                     }
                     for w in words
                 ]
@@ -1932,7 +2148,10 @@ class VideoBuilder:
                     for idx, w in enumerate(word_list)
                 ]
             words = sorted(words, key=lambda x: x.get('start', 0.0))
-            prepared.append({'start': seg_start, 'end': seg_end, 'words': words})
+            prepared.append({
+                'start': seg_start, 'end': seg_end, 'words': words,
+                'transient': bool(segment.get('transient', False)),
+            })
 
         prepared.sort(key=lambda s: s['start'])
         if not prepared:
@@ -1957,25 +2176,39 @@ class VideoBuilder:
             return idx
 
         def build_window(cur, t):
-            """The lines visible at time t if `cur` were the current line."""
+            """The lines visible at time t if `cur` were the current line.
+            A 'transient' segment (e.g. a countdown) is only ever shown
+            while it is itself the current line -- never as an upcoming
+            preview, and never lingering as a previous line."""
             window = []
             if cur is None:
-                for j in range(0, min(context_n, n)):
+                shown = 0
+                for j in range(n):
                     seg = prepared[j]
-                    if t >= seg['start'] - upcoming_lead:
-                        window.append((j, seg, False))
-                    else:
+                    if seg['transient']:
+                        continue
+                    if shown >= context_n or t < seg['start'] - upcoming_lead:
                         break
+                    window.append((j, seg, False))
+                    shown += 1
             else:
-                for j in range(max(0, cur - context_n), cur):
-                    window.append((j, prepared[j], False))
+                before = []
+                j = cur - 1
+                while j >= 0 and len(before) < context_n:
+                    if not prepared[j]['transient']:
+                        before.append((j, prepared[j], False))
+                    j -= 1
+                window.extend(reversed(before))
                 window.append((cur, prepared[cur], True))
-                for j in range(cur + 1, min(n, cur + 1 + context_n)):
+                after = 0
+                for j in range(cur + 1, n):
                     seg = prepared[j]
-                    if t >= seg['start'] - upcoming_lead:
-                        window.append((j, seg, False))
-                    else:
+                    if seg['transient']:
+                        continue
+                    if after >= context_n or t < seg['start'] - upcoming_lead:
                         break
+                    window.append((j, seg, False))
+                    after += 1
             return window
 
         boundaries = {0.0, clip_duration}
@@ -2032,11 +2265,14 @@ class VideoBuilder:
         # consecutive output frames overwhelmingly land in the same
         # interval and reuse the same rasterized image rather than
         # re-rendering it.
+        layer_cache = {'idx': None, 'layer': None}
         cache = {'idx': None, 'rgba': None}
 
-        def rasterize(idx: int) -> np.ndarray:
-            if cache['idx'] == idx:
-                return cache['rgba']
+        def rasterize_layer(idx: int) -> Optional[Tuple[np.ndarray, int, int]]:
+            """Interval idx's lyric layer as (RGBA pixels, x, y) already
+            clipped to the canvas, or None when nothing is visible."""
+            if layer_cache['idx'] == idx:
+                return layer_cache['layer']
 
             t1, t2 = boundaries[idx], boundaries[idx + 1]
             mid = (t1 + t2) / 2.0
@@ -2066,7 +2302,7 @@ class VideoBuilder:
                 print(f"Error rendering scrolling lyrics frame: {e}")
                 traceback.print_exc()
 
-            canvas = np.zeros((height, width, 4), dtype=np.uint8)
+            layer = None
             if frame_img is not None:
                 frame_arr = np.array(frame_img)
                 if frame_arr.size:
@@ -2074,7 +2310,22 @@ class VideoBuilder:
                     x0, y0 = max(0, frame_x), max(0, frame_y)
                     x1, y1 = min(width, frame_x + fw), min(height, frame_y + fh)
                     if x1 > x0 and y1 > y0:
-                        canvas[y0:y1, x0:x1] = frame_arr[y0 - frame_y:y1 - frame_y, x0 - frame_x:x1 - frame_x]
+                        layer = (frame_arr[y0 - frame_y:y1 - frame_y, x0 - frame_x:x1 - frame_x], x0, y0)
+
+            layer_cache['idx'] = idx
+            layer_cache['layer'] = layer
+            return layer
+
+        def rasterize(idx: int) -> np.ndarray:
+            """Interval idx's lyric layer as a full-canvas RGBA array."""
+            if cache['idx'] == idx:
+                return cache['rgba']
+
+            canvas = np.zeros((height, width, 4), dtype=np.uint8)
+            layer = rasterize_layer(idx)
+            if layer is not None:
+                pixels, x0, y0 = layer
+                canvas[y0:y0 + pixels.shape[0], x0:x0 + pixels.shape[1]] = pixels
 
             cache['idx'] = idx
             cache['rgba'] = canvas
@@ -2091,6 +2342,27 @@ class VideoBuilder:
             return rasterize(boundary_index_at(t))[:, :, 3].astype(np.float32) / 255.0
 
         try:
+            if static_background:
+                print("DEBUG: Compositing lazily-rasterized scrolling lyrics over a static background...")
+                # One composite, once: whatever base (+ static overlay images)
+                # video_clip is, wrapped the same way the general path below
+                # wraps it, so transparency is flattened identically.
+                background = CompositeVideoClip([video_clip], size=video_clip.size).get_frame(0)
+                composed = {'idx': None, 'frame': None}
+
+                def make_static_frame(t):
+                    idx = boundary_index_at(t)
+                    if composed['idx'] != idx:
+                        composed['frame'] = _blend_layer_over(background, rasterize_layer(idx))
+                        composed['idx'] = idx
+                    return composed['frame']
+
+                final_clip = VideoClip(frame_function=make_static_frame, duration=clip_duration)
+                final_clip = final_clip.with_fps(video_clip.fps or fps)
+                if video_clip.audio:
+                    final_clip = final_clip.with_audio(video_clip.audio)
+                return final_clip
+
             print("DEBUG: Compositing video with lazily-rasterized scrolling lyrics overlay...")
             overlay_mask = VideoClip(frame_function=make_mask_frame, is_mask=True, duration=clip_duration)
             overlay_clip = VideoClip(frame_function=make_frame, duration=clip_duration).with_mask(overlay_mask)
@@ -2296,6 +2568,10 @@ class VideoBuilder:
         row_glow_color = with_alpha(style.glow_color or highlight_color) if glow_radius > 0 else None
 
         for curr_x, curr_y, word_text, w_dict, w_width in positions:
+            # A 'vanish' word (e.g. a countdown digit) stops being drawn once
+            # it has passed, while the remaining words keep their positions.
+            if w_dict.get('vanish') and current_time is not None and current_time >= w_dict.get('end', 0.0):
+                continue
             draw_text = word_text + " "
             if is_current_style and karaoke and current_time is not None:
                 w_start = w_dict.get('start', 0.0)
@@ -2752,6 +3028,23 @@ class VideoBuilder:
 _CHUNK_SEGMENT_PAD_S = 10.0
 
 
+def _blend_layer_over(background: np.ndarray, layer: Optional[Tuple[np.ndarray, int, int]]) -> np.ndarray:
+    """Alpha-composite an RGBA layer (pixels, x, y) onto an RGB uint8
+    background, touching only the layer's own bounding box. The blend is
+    PIL's alpha_composite -- the same one moviepy's own CompositeVideoClip
+    uses -- so the result matches a full-frame composite. background is never
+    modified; with nothing to draw it's returned as-is (callers only read it)."""
+    if layer is None:
+        return background
+    pixels, x0, y0 = layer
+    h, w = pixels.shape[:2]
+    region = Image.fromarray(background[y0:y0 + h, x0:x0 + w]).convert("RGBA")
+    region = Image.alpha_composite(region, Image.fromarray(pixels))
+    out = background.copy()
+    out[y0:y0 + h, x0:x0 + w] = np.asarray(region)[:, :, :3]
+    return out
+
+
 def _segments_overlapping_window(segments: Optional[List[Dict]], window_start: float, window_end: float) -> Optional[List[Dict]]:
     """Subset of `segments` whose own [start, end] overlaps [window_start,
     window_end]. _render_video_chunk uses this so a worker only builds the
@@ -2812,6 +3105,13 @@ def _render_video_chunk(state: Dict, t0: float, t1: float, chunk_output_path: st
         if t1 <= t0:
             return None
 
+        # Deliberately libx264, not _write_videofile_gpu_first: N of these run
+        # concurrently (one per multiprocessing worker) against a single
+        # physical GPU encoder, and consumer/GeForce NVENC has a
+        # driver-enforced concurrent-session cap (historically ~3) that
+        # would fail most workers outright rather than just queue them.
+        # Compositing (this function's actual bottleneck -- see
+        # _save_parallel's docstring) is unaffected either way.
         chunk_clip = clip.subclipped(t0, t1)
         chunk_clip.write_videofile(
             chunk_output_path,
@@ -2819,6 +3119,7 @@ def _render_video_chunk(state: Dict, t0: float, t1: float, chunk_output_path: st
             codec="libx264",
             audio=False,
             logger=None,
+            threads=PARALLEL_RENDER_ENCODER_THREADS,
         )
         return chunk_output_path
     except Exception:

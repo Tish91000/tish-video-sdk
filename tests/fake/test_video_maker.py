@@ -209,7 +209,7 @@ class TestTextSegments:
         result = builder.build()
 
         assert result is mock_overlaid
-        mock_overlay.assert_called_once_with(mock_video, segments)
+        mock_overlay.assert_called_once_with(mock_video, segments, static_background=True)
 
     @patch('tish_video_sdk.video_maker.os.path.exists')
     @patch('tish_video_sdk.video_maker.VideoBuilder._overlay_text_segments_on_single_clip')
@@ -328,7 +328,7 @@ class TestSubtitlesWiring:
         result = builder.build()
 
         assert result is mock_overlaid
-        mock_overlay.assert_called_once_with(mock_video, segments)
+        mock_overlay.assert_called_once_with(mock_video, segments, static_background=True)
 
 
 class TestAdvancedSegments:
@@ -400,3 +400,191 @@ class TestAdvancedSegments:
         assert builder._bgm_cache == {}
         mock_video_clip.close.assert_called_once()
         mock_bgm_clip.close.assert_called_once()
+
+class TestParallelWorkerDecision:
+    """VideoBuilder._save_parallel must always say how many workers it chose
+    and why -- a silent drop to one worker cost a 50-minute render."""
+
+    def _builder(self, duration=352.0):
+        builder = VideoBuilder()
+        builder.video_clip = MagicMock(duration=duration)
+        return builder
+
+    def _run(self, builder, free_gib, cpus=16, env=None):
+        mem = MagicMock(available=int(free_gib * 1024 ** 3))
+        pool = MagicMock()
+        pool.return_value.__enter__.return_value.starmap.return_value = [None]
+        with patch.object(VideoBuilder, '_capture_rebuild_state', return_value={}), \
+             patch('tish_video_sdk.video_maker.os.cpu_count', return_value=cpus), \
+             patch('psutil.virtual_memory', return_value=mem), \
+             patch('multiprocessing.Pool', pool), \
+             patch.dict('os.environ', env or {}, clear=False):
+            result = builder._save_parallel('out.mp4')
+        return result, pool
+
+    def test_low_memory_logs_decision_and_warns(self, capsys):
+        result, pool = self._run(self._builder(), free_gib=2.4)
+        out = capsys.readouterr().out
+        assert result is None
+        pool.assert_not_called()
+        assert "Parallel render: 1 worker(s)" in out
+        assert "memory cap 1" in out
+        assert "running single-process" in out
+        assert "WARNING: parallel render skipped for lack of free memory" in out
+
+    def test_enough_memory_logs_parallel_without_warning(self, capsys):
+        self._run(self._builder(), free_gib=8.0)
+        out = capsys.readouterr().out
+        assert "Parallel render: 5 worker(s)" in out
+        assert "chunked parallel" in out
+        assert "WARNING" not in out
+
+    def test_single_core_limit_is_not_blamed_on_memory(self, capsys):
+        self._run(self._builder(), free_gib=2.4, cpus=2)
+        out = capsys.readouterr().out
+        assert "Parallel render: 1 worker(s)" in out
+        assert "WARNING" not in out
+
+    def test_workers_env_overrides_memory_cap(self, capsys):
+        self._run(self._builder(), free_gib=2.4, env={"TISH_VIDEO_RENDER_WORKERS": "4"})
+        out = capsys.readouterr().out
+        assert "Parallel render: 4 worker(s)" in out
+        assert "TISH_VIDEO_RENDER_WORKERS=4" in out
+
+    def test_mem_per_worker_env_changes_memory_cap(self, capsys):
+        self._run(self._builder(), free_gib=2.4, env={"TISH_VIDEO_MEM_PER_WORKER_MB": "400"})
+        assert "Parallel render: 4 worker(s)" in capsys.readouterr().out
+
+    def test_invalid_env_is_ignored_with_message(self, capsys):
+        self._run(self._builder(), free_gib=8.0, env={"TISH_VIDEO_RENDER_WORKERS": "lots"})
+        out = capsys.readouterr().out
+        assert "Ignoring TISH_VIDEO_RENDER_WORKERS='lots'" in out
+        assert "Parallel render: 5 worker(s)" in out
+
+
+class TestRenderChunkEncoder:
+    def test_chunk_encoder_threads_are_capped(self):
+        import tish_video_sdk.video_maker as vm
+        builder = MagicMock()
+        builder.build.return_value = MagicMock(duration=60.0, audio=None)
+        state = {'fps': 20, 'width': 1920, 'height': 1080, 'image_filepath': 'i.png',
+                 'image_segments': None, 'audio_filepath': None, 'text_segments': None,
+                 'text_style': None, 'overlay_images': [], 'overlay_video_path': None,
+                 'overlay_video_config': {}}
+        with patch.object(vm, 'VideoBuilder', return_value=builder):
+            assert vm._render_video_chunk(state, 0.0, 20.0, 'chunk.mp4') == 'chunk.mp4'
+        chunk_clip = builder.build.return_value.subclipped.return_value
+        kwargs = chunk_clip.write_videofile.call_args.kwargs
+        assert kwargs['codec'] == 'libx264'
+        assert kwargs['threads'] == vm.PARALLEL_RENDER_ENCODER_THREADS
+
+
+class TestGpuEncodeValidation:
+    """A GPU encode that exits 0 but wrote an undecodable file must be
+    re-encoded with libx264, not reported as success."""
+
+    def setup_method(self):
+        import tish_video_sdk.video_maker as vm
+        self.vm = vm
+        self._saved_cache = vm._video_codec_cache
+
+    def teardown_method(self):
+        self.vm._video_codec_cache = self._saved_cache
+
+    def test_corrupt_nvenc_output_is_reencoded_with_libx264(self):
+        self.vm._video_codec_cache = ("h264_nvenc", ["-rc", "vbr"])
+        clip = MagicMock()
+        with patch.object(self.vm, '_count_decode_errors', return_value=18667):
+            self.vm._write_videofile_gpu_first(clip, 'v.mp4', fps=20)
+        codecs = [c.kwargs['codec'] for c in clip.write_videofile.call_args_list]
+        assert codecs == ["h264_nvenc", "libx264"]
+        assert self.vm._video_codec_cache == ("libx264", None)
+
+    def test_clean_nvenc_output_is_kept(self):
+        self.vm._video_codec_cache = ("h264_nvenc", ["-rc", "vbr"])
+        clip = MagicMock()
+        with patch.object(self.vm, '_count_decode_errors', return_value=0):
+            self.vm._write_videofile_gpu_first(clip, 'v.mp4', fps=20)
+        clip.write_videofile.assert_called_once()
+        assert self.vm._video_codec_cache[0] == "h264_nvenc"
+
+    def test_unrunnable_validator_does_not_trigger_reencode(self):
+        self.vm._video_codec_cache = ("h264_nvenc", ["-rc", "vbr"])
+        clip = MagicMock()
+        with patch.object(self.vm, '_count_decode_errors', return_value=None):
+            self.vm._write_videofile_gpu_first(clip, 'v.mp4', fps=20)
+        clip.write_videofile.assert_called_once()
+
+    def test_libx264_output_is_not_validated(self):
+        self.vm._video_codec_cache = ("libx264", None)
+        clip = MagicMock()
+        with patch.object(self.vm, '_count_decode_errors') as count:
+            self.vm._write_videofile_gpu_first(clip, 'v.mp4', fps=20)
+        count.assert_not_called()
+
+    def test_raising_gpu_encode_still_falls_back(self):
+        self.vm._video_codec_cache = ("h264_nvenc", ["-rc", "vbr"])
+        clip = MagicMock()
+        clip.write_videofile.side_effect = [RuntimeError("nvenc"), None]
+        self.vm._write_videofile_gpu_first(clip, 'v.mp4', fps=20)
+        assert clip.write_videofile.call_args_list[-1].kwargs['codec'] == "libx264"
+
+    def test_missing_file_is_not_treated_as_corrupt(self, tmp_path):
+        assert self.vm._count_decode_errors(str(tmp_path / "nope.mp4")) is None
+
+class TestStaticBackgroundFastPath:
+    """Scrolling lyrics over a never-changing picture skip per-frame
+    full-canvas compositing; anything that animates the picture must not."""
+
+    def _built_flag(self, configure):
+        builder = VideoBuilder()
+        builder._duration = 5.0
+        builder._text_segments = [{'text': 'x', 'start': 0.0, 'end': 5.0}]
+        builder.video_clip = MagicMock(duration=5.0)
+        configure(builder)
+        with patch.object(VideoBuilder, '_create_single_image_video_clip', return_value=builder.video_clip), \
+             patch.object(VideoBuilder, '_create_multi_image_video_clip', return_value=builder.video_clip), \
+             patch.object(VideoBuilder, '_overlay_text_segments_on_single_clip', return_value=builder.video_clip) as overlay:
+            builder.build()
+        return overlay.call_args.kwargs['static_background']
+
+    def test_single_image_is_static(self):
+        assert self._built_flag(lambda b: setattr(b, '_image_filepath', 'i.png')) is True
+
+    def test_overlay_video_is_not_static(self):
+        def configure(b):
+            b._image_filepath = 'i.png'
+            b._overlay_video_path = 'o.mp4'
+        assert self._built_flag(configure) is False
+
+    def test_multi_image_segments_are_not_static(self):
+        def configure(b):
+            b._image_filepath = None
+            b._image_segments = [{'image_path': 'a.png', 'duration': 2.0}]
+        assert self._built_flag(configure) is False
+
+    def test_blend_layer_over_matches_full_frame_alpha_composite(self):
+        import numpy as np
+        from PIL import Image
+        from tish_video_sdk.video_maker import _blend_layer_over
+        rng = np.random.default_rng(0)
+        background = rng.integers(0, 256, (40, 60, 3), dtype=np.uint8)
+        pixels = rng.integers(0, 256, (10, 20, 4), dtype=np.uint8)
+        original = background.copy()
+
+        out = _blend_layer_over(background, (pixels, 15, 8))
+
+        canvas = np.zeros((40, 60, 4), dtype=np.uint8)
+        canvas[8:18, 15:35] = pixels
+        expected = Image.alpha_composite(
+            Image.fromarray(background).convert("RGBA"), Image.fromarray(canvas)
+        )
+        assert np.array_equal(out, np.asarray(expected)[:, :, :3])
+        assert np.array_equal(background, original)  # input never mutated
+
+    def test_blend_with_no_layer_returns_background(self):
+        import numpy as np
+        from tish_video_sdk.video_maker import _blend_layer_over
+        background = np.zeros((4, 4, 3), dtype=np.uint8)
+        assert _blend_layer_over(background, None) is background
+
